@@ -1,276 +1,77 @@
-<div align="center">
-   <br />
-   <img align="center" width="128px" src="https://raw.githubusercontent.com/hcavarsan/kftray-blog/main/img/logo.png" />
-   <h1 align="center"><b>kftray</b></h1>
-   <p align="center">
-      A cross-platform system tray application for managing multiple kubectl port-forward commands, with support for UDP and proxy connections through k8s clusters.
-
-   </p>
-   <p align="center">
-   <a href="https://kftray.app"><strong>kftray.app »</strong></a>
-   <p />
-   <img src="https://raw.githubusercontent.com/hcavarsan/kftray-blog/main/img/ss3.png" alt="kftray" width="800px" />
-
-   </div>
-
-   <h2> Download latest release </h2>
-<div align="left">
-         <a href="https://github.com/hcavarsan/kftray/releases/latest/download/kftray_0.11.7_universal.dmg">
-            <img src="https://img.shields.io/badge/-macOS (Universal)-grey.svg?style=for-the-badge&logo=apple" alt="Download for macOS" />
-         </a>
-         <a href="https://github.com/hcavarsan/kftray/releases/latest/download/kftray_0.11.7_arm64-setup.exe">
-            <img src="https://img.shields.io/badge/-Windows (ARM64)-grey.svg?style=for-the-badge&logo=windows" alt="Download for Windows ARM64" />
-         </a>
-         <br />
-         <a href="https://github.com/hcavarsan/kftray/releases/latest/download/kftray_0.11.7_x64-setup.exe">
-            <img src="https://img.shields.io/badge/-Windows (x64)-grey.svg?style=for-the-badge&logo=windows" alt="Download for Windows x64" />
-         </a>
-         <a href="https://github.com/hcavarsan/kftray/releases/latest/download/kftray_0.11.7_x86-setup.exe">
-            <img src="https://img.shields.io/badge/-Windows (x86)-grey.svg?style=for-the-badge&logo=windows" alt="Download for Windows x86" />
-         </a>
-         <br />
-         <a href="https://github.com/hcavarsan/kftray/releases/latest/download/kftray_0.11.7_amd64.AppImage">
-            <img src="https://img.shields.io/badge/-Linux (x64)-grey.svg?style=for-the-badge&logo=linux" alt="Download for Linux AMD64" />
-         </a>
-         <a href="https://github.com/hcavarsan/kftray/releases/latest/download/kftray_0.11.7_aarch64.AppImage">
-            <img src="https://img.shields.io/badge/-Linux (ARM64)-grey.svg?style=for-the-badge&logo=linux" alt="Download for Linux AARCH64" />
-         </a>
+<div align="center">  <br>
+  <img src="https://raw.githubusercontent.com/hcavarsan/kftray-blog/main/img/logo.png" width="128px" alt="kftray Logo" />
+  <br><br>
+  <a href="https://kftray.app">Website</a> | <a href="https://kftray.app/downloads">Downloads</a> | <a href="https://kftray.app/docs">Docs</a> | <a href="https://kftray.app/blog">Blog</a>
+  <br><br>
+  <a href="https://join.slack.com/t/kftray/shared_invite/zt-2q6lwn15f-Y8Mi_4NlenH9TuEDMjxPUA">
+    <img src="https://img.shields.io/badge/Slack-Join%20our%20Slack-blue?style=for-the-badge&logo=slack" alt="Join Slack">
+  </a>
+  <a href="https://github.com/hcavarsan/kftray/releases">
+    <img src="https://img.shields.io/github/v/release/hcavarsan/kftray?style=for-the-badge" alt="Latest Release">
+  </a>
+  <a href="https://github.com/hcavarsan/kftray">
+    <img src="https://img.shields.io/github/downloads/hcavarsan/kftray/total?style=for-the-badge" alt="Total Downloads">
+  </a>
+  <a href="https://codecov.io/gh/hcavarsan/kftray">
+    <img src="https://img.shields.io/codecov/c/github/hcavarsan/kftray/main?style=for-the-badge&logo=codecov" alt="Codecov Coverage">
+  </a>
+  <a href="https://crates.io/crates/kftui">
+    <img src="https://img.shields.io/crates/v/kftui?style=for-the-badge&logo=rust" alt="Crates.io">
+  </a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/hcavarsan/kftray">
+    <img src="https://img.shields.io/ossf-scorecard/github.com/hcavarsan/kftray?style=for-the-badge&label=openssf%20scorecard" alt="OpenSSF Scorecard">
+  </a>
+  <a href="https://www.bestpractices.dev/projects/11850">
+    <img src="https://img.shields.io/cii/percentage/11850?style=for-the-badge&label=openssf%20best%20practices" alt="OpenSSF Best Practices">
+  </a>
+  <br><br>
 </div>
 
-<br/>
-  <h2>Overview</h1>
-  <p>kftray is a cross-platform system tray app made with Tauri (Rust and TypeScript) for Kubernetes users. It simplifies setting up multiple kubectl port forward configurations through a user-friendly interface. Easily store and manage all configurations from local files or GitHub repositories.</p>
-    <p><strong>Learn More:</strong> <a href="https://kftray.hashnode.dev/kubernetes-debugging-handling-multiple-kubectl-port-forward-from-tray">Blog Post - Kubernetes Debugging with KFtray</a></p>
+<p align="center">
+  <a href="https://kftray.app">
+    <img src="https://raw.githubusercontent.com/hcavarsan/kftray-blog/main/public/video/kftray-intro-v1-readme.webp" alt="kftray and kftui demo" width="960"/>
+  </a>
+</p>
 
-  <table>
-    <tr>
-      <td><strong>Kftray Overview</strong></td>
-      <td><strong>Demo: GitHub Sync</strong></td>
-      <td><strong>Demo: Adding a New Configuration</strong></td>
-    </tr>
-    <tr>
-      <td>
-        <a href="https://www.youtube.com/watch?v=9fQO7x4mqn8">
-          <img src="https://img.youtube.com/vi/9fQO7x4mqn8/0.jpg" alt="Kftray Overview" width="256"/>
-        </a>
-      </td>
-      <td>
-        <a href="https://www.youtube.com/watch?v=BAdL7IzaEh8">
-          <img src="https://img.youtube.com/vi/BAdL7IzaEh8/0.jpg" alt="Kftray Demo: Github Sync" width="256"/>
-        </a>
-      </td>
-      <td>
-        <a href="https://www.youtube.com/watch?v=nqEhmcKeCc4">
-          <img src="https://img.youtube.com/vi/nqEhmcKeCc4/0.jpg" alt="Kftray Demo: Adding a new configuration" width="256"/>
-        </a>
-      </td>
-    </tr>
-  </table>
-  <br>
-<br/>
+## About
 
-## Table of Contents
+kftray and kftui manage Kubernetes port forwards from your desktop or terminal. Both apps share configurations and a Rust backend that reconnects forwards when pods restart or connections drop.
 
-- [Features](#-features)
-- [Installation](#-installation)
-- [Usage](#-usage)
-- [Architecture](#-architecture)
-- [Contributing](#-contributing)
-- [License](#-license)
+- [kftray](https://kftray.app/docs/interfaces/desktop) runs as a desktop app with system tray integration.
+- [kftui](https://kftray.app/docs/interfaces/terminal) runs in the terminal, with a CLI for scripts and headless use.
 
-## 🚀 Features
+Watch the [app overview](https://www.youtube.com/watch?v=j2NnhIIFYHw) or the [HTTP logging demo](https://www.youtube.com/watch?v=73PyGbMnNSY).
 
-- **Resilient Port Forwarding Connection:** Ensures continuous service even if a pod dies, by reconnecting to another running pod automatically.
-- **One-Click Multiple Port Forwards:** Allows for the setup of several port forwarding instances at the same time with a single click.
-- **Independent of Kubectl:** Directly interfaces with the Kubernetes API, eliminating the need for `kubectl`.
-- **Multi-Protocol Support:** Enables access to internal or external servers through a Proxy Relay server deployed in a Kubernetes cluster, including TCP and UDP port forwarding.
-- **HTTP Logs Tracing**: Enable or disable HTTP logs for specific configurations to save the requests and responses in a local log file.
+## Features
 
-## 📦 Installation
+- Run multiple forwards across Kubernetes contexts without `kubectl`.
+- Forward TCP and UDP traffic to services or pods, or reach other hosts through a cluster proxy.
+- Expose local services to the cluster or through an ingress.
+- Inspect HTTP traffic and replay requests in kftui.
+- Share configs through GitHub or discover services from Kubernetes annotations.
+- Organize configs with tags, filters and grouping.
 
-KFtray is available for macOS and Linux users via Homebrew, and directly from the GitHub releases page for other systems. Here's how you can get started:
+See the [documentation](https://kftray.app/docs) for configuration options and app behavior.
 
-**For macOS**
+## Get started
 
-```bash
-brew tap hcavarsan/kftray
-brew install --HEAD kftray
-```
+Download [kftray or kftui](https://kftray.app/downloads), follow the [installation guide](https://kftray.app/docs/getting-started/installation) and create your [first port forward](https://kftray.app/docs/getting-started/quick-start).
 
-**For Linux**
+- [Configuration](https://kftray.app/docs/configuration): fields, workload types and shared settings.
+- [CLI reference](https://kftray.app/docs/resources/cli-reference): flags and commands for kftui.
+- [Architecture](https://kftray.app/docs/resources/architecture): the shared core and cluster relay.
+- [Security](https://kftray.app/docs/resources/security): vulnerability reporting and release verification.
+- [Releases](https://github.com/hcavarsan/kftray/releases): changes and release assets.
 
-```bash
-brew tap hcavarsan/kftray
-brew install kftray-linux
-```
+## Contributing
 
-_Please check the caveats section for global app creation instructions after installation._
+Read the [contribution guide](https://kftray.app/docs/resources/contributing) and [code of conduct](https://kftray.app/docs/resources/code-of-conduct). For local builds, see [development](https://kftray.app/docs/resources/development) and [building from source](https://kftray.app/docs/resources/building-from-source).
 
-Linux Note: due to GTK limitations, it is necessary to install and enable the GNOME Shell extension for AppIndicator support to kftray works. See here: <https://extensions.gnome.org/extension/615/appindicator-support/>
+Report bugs or request features through [GitHub issues](https://github.com/hcavarsan/kftray/issues). Use [Discussions](https://github.com/hcavarsan/kftray/discussions) or [Slack](https://join.slack.com/t/kftray/shared_invite/zt-2q6lwn15f-Y8Mi_4NlenH9TuEDMjxPUA) for questions.
 
-For other systems, visit the [GitHub releases page](https://github.com/hcavarsan/kftray/releases) for downloadable binaries.
+## License
 
-## 🧭 Usage
-
-## 🎛 Configuring Your First Port Forward
-
-In a few simple steps, you can configure your first port forward:
-
-1. **Launch the application**
-2. **Open the configuration panel from the tray icon**
-3. **Add a new configuration:**
-
-   - Give it a unique alias and set if you want to set the alias as domain to your forward \*1
-   - Indicate if the configuration is for a port forward for a service (common use) or a proxy (port forward to an endpoint via a Kubernetes cluster).
-   - Specify the Kubernetes context
-   - Define the namespace housing your service
-   - Enter the service name
-   - Choose TCP or UDP
-   - Set the local and remote port numbers
-   - Configure a custom local IP address (optional)
-
-4. **Activate Your Configuration**: With your configuration saved, simply click on the switch button in the main menu to start the port forward in a single por forward or in Start All to start all configurations at the same time
-
-> Note: To use the alias feature with a local domain name, you must enable write permissions in the hosts file. This method is not secure. We are addressing this in the following issue: [https://github.com/hcavarsan/kftray/issues/171](https://github.com/hcavarsan/kftray/issues/171).
-> Follow these steps to allow write access:
->
-> For Windows:
->
-> ```bash
-> icacls "C:\Windows\System32\drivers\etc\hosts" /grant Everyone:(R,W)
-> ```
->
-> For MacOS and Linux:
->
-> ```bash
-> sudo chmod ugo+rw /etc/hosts
-> ```
-
-## Export configurations to a JSON file
-
-1. Open the main menu in the footer
-2. Select the `Export Local File` option
-3. Choose a file name and location to save the JSON file
-4. The JSON file will contain all your current configurations
-
-You can then import this JSON file at any time to restore your configurations.
-
-Example Json configuration File:
-
-```json
-[
-  {
-    "service": "argocd-server",
-    "namespace": "argocd",
-    "local_port": 8888,
-    "remote_port": 8080,
-    "context": "test-cluster",
-    "workload_type": "service",
-    "protocol": "tcp",
-    "remote_address": "",
-    "local_address": "127.0.0.1",
-    "alias": "argocd",
-    "domain_enabled": true
-  }
-]
-```
-
-## Sharing the configurations through Git
-
-now, with the local json saved, you can share your configurations with your team members by committing the JSON file to a GitHub repository. This allows for easy collaboration and synchronization of KFtray configurations across your team.
-
-To import and sync your GitHub configs in kftray:
-
-
-1.  Open the application's main menu
-2.  Select the button with GitHub icon in the footer menu
-4.  Enter the URL of your Git repository and path containing the JSON file
-5.  If your GitHub repository is private, you will need to enter the private token. Credentials are securely saved in the SO keyring (Keychain on macOS). Kftray does not store or save credentials in any local file; they are only stored in the local keyring.
-6.  Select the polling time for when Kftray will synchronize configurations and retrieve them from GitHub.
-
-
-6. KFtray will now sync with the Git repository to automatically import any new configurations or changes committed to the JSON file.
-
-This allows you to quickly deploy any port forward changes to all team members. And if someone on your team adds a new configuration, it will be automatically synced to everyone else's KFtray.
-
-## Building from Source
-
-### Requirements
-
-- Node.js and pnpm or yarn for building the frontend.
-- Rust for building the backend.
-
-To compile `kftray`, these steps should be followed:
-
-1. Clone the repository:
-
-   ```bash
-   git clone https://github.com/hcavarsan/kftray.git
-   ```
-
-2. Navigate to the cloned directory:
-
-   ```bash
-   cd kftray
-   ```
-
-3. Install dependencies:
-
-   ```bash
-   pnpm install
-   ```
-
-4. Launch the application in development mode:
-
-   ```bash
-   pnpm run tauri dev
-   ```
-
-## 🏗 Architecture
-
-### Server
-
-KFtray Server is a Rust application that relays UDP/TCP traffic to an upstream server. Check the source code [here](https://github.com/hcavarsan/kftray/tree/main/crates/kftray-server).
-
-### Forwarding Flows
-
-- **TCP Forwarding:** A local TCP socket, similar to kubectl, can be used to communicate with a Kubernetes pod. This approach offers parallel execution and improved resilience.
-
-```mermaid
-sequenceDiagram
-Application->>Kubernetes Pod: Opens TCP socket, starts port-forwarding
-Kubernetes Pod-->>Application: Responds with TCP Packet
-```
-
-- **Proxy TCP Forwarding:** The local TCP connects to the kftray-server pod, which then sends TCP packet to the upstream server.
-
-```mermaid
-sequenceDiagram
-Application->>Kubernetes Pod: Socket to kftray-server, facilitates TCP relay
-Kubernetes Pod->>Remote Service: Relays TCP Packet
-Remote Service-->>Kubernetes Pod: Responds
-Kubernetes Pod-->>Application: Returns TCP Packet
-```
-
-- **UDP Forwarding:** The KFtray client opens a local UDP socket and connects a local TCP socket to the kftray-server pod. The TCP socket sends UDP packets over TCP, which are then forwarded to the upstream server.
-
-```mermaid
-sequenceDiagram
-Application->>Kubernetes Pod: UDP socket, TCP port-forward to kftray-server
-Kubernetes Pod->>Service/Remote: Converts to UDP, sends packet
-Service/Remote-->>Kubernetes Pod: Responds with UDP Packet
-Kubernetes Pod-->>Application: Relays as TCP
-```
-
-## 👥 Contributing
-
-- 🛠 **Pull Requests**: Feel free to create pull requests for bug fixes, new features, or improvements.
-- 📝 **Issues**: Report bugs, suggest new features, or ask questions.
-- 💡 **Feedback**: Your feedback helps improve kftray.
-
-## 📄 License
-
-KFtray is available under the [MIT License](LICENSE.md), which is included in the repository. See the LICENSE file for full details.
+kftray is licensed under [GPL-3.0](LICENSE).
 
 ## Star History
 
@@ -282,9 +83,9 @@ KFtray is available under the [MIT License](LICENSE.md), which is included in th
  </picture>
 </a>
 
-## Contributors ✨
+## Contributors
 
-Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/docs/en/emoji-key)):
+Contributors are listed below using the [all-contributors](https://allcontributors.org/docs/en/emoji-key) contribution types.
 
 <!-- ALL-CONTRIBUTORS-LIST:START - Do not remove or modify this section -->
 <!-- prettier-ignore-start -->
@@ -295,6 +96,17 @@ Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/d
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/hcavarsan"><img src="https://avatars.githubusercontent.com/u/30353685?v=4?s=100" width="100px;" alt="Henrique Cavarsan"/><br /><sub><b>Henrique Cavarsan</b></sub></a><br /><a href="https://github.com/hcavarsan/kftray/commits?author=hcavarsan" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="http://fandujar.dev"><img src="https://avatars.githubusercontent.com/u/6901387?v=4?s=100" width="100px;" alt="Filipe Andujar"/><br /><sub><b>Filipe Andujar</b></sub></a><br /><a href="https://github.com/hcavarsan/kftray/commits?author=fandujar" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://speakerdeck.com/eltociear"><img src="https://avatars.githubusercontent.com/u/22633385?v=4?s=100" width="100px;" alt="Ikko Eltociear Ashimine"/><br /><sub><b>Ikko Eltociear Ashimine</b></sub></a><br /><a href="https://github.com/hcavarsan/kftray/commits?author=eltociear" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/honsunrise"><img src="https://avatars.githubusercontent.com/u/3882656?v=4?s=100" width="100px;" alt="Honsun Zhu"/><br /><sub><b>Honsun Zhu</b></sub></a><br /><a href="https://github.com/hcavarsan/kftray/commits?author=honsunrise" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://www.linkedin.com/in/peter-hansson-07939a231"><img src="https://avatars.githubusercontent.com/u/9850798?v=4?s=100" width="100px;" alt="Peter Hansson"/><br /><sub><b>Peter Hansson</b></sub></a><br /><a href="https://github.com/hcavarsan/kftray/commits?author=Lunkentuss" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/FabijanZulj"><img src="https://avatars.githubusercontent.com/u/38249221?v=4?s=100" width="100px;" alt="FabijanZulj"/><br /><sub><b>FabijanZulj</b></sub></a><br /><a href="https://github.com/hcavarsan/kftray/commits?author=FabijanZulj" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/skht"><img src="https://avatars.githubusercontent.com/u/1878554?v=4?s=100" width="100px;" alt="skht"/><br /><sub><b>skht</b></sub></a><br /><a href="https://github.com/hcavarsan/kftray/commits?author=skht" title="Code">💻</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/kgara"><img src="https://avatars.githubusercontent.com/u/14247772?v=4?s=100" width="100px;" alt="kgara"/><br /><sub><b>kgara</b></sub></a><br /><a href="https://github.com/hcavarsan/kftray/commits?author=kgara" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/ramezbenaribia"><img src="https://avatars.githubusercontent.com/u/55209480?v=4?s=100" width="100px;" alt="Ramez Ben Aribia"/><br /><sub><b>Ramez Ben Aribia</b></sub></a><br /><a href="https://github.com/hcavarsan/kftray/commits?author=ramezbenaribia" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://knktc.com/"><img src="https://avatars.githubusercontent.com/u/863586?v=4?s=100" width="100px;" alt="knktc"/><br /><sub><b>knktc</b></sub></a><br /><a href="https://github.com/hcavarsan/kftray/commits?author=knktc" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="http://www.xrow.de/"><img src="https://avatars.githubusercontent.com/u/295491?v=4?s=100" width="100px;" alt="Björn Dieding"/><br /><sub><b>Björn Dieding</b></sub></a><br /><a href="https://github.com/hcavarsan/kftray/commits?author=xrow" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/mvanhorn"><img src="https://avatars.githubusercontent.com/u/455140?v=4?s=100" width="100px;" alt="Matt Van Horn"/><br /><sub><b>Matt Van Horn</b></sub></a><br /><a href="https://github.com/hcavarsan/kftray/commits?author=mvanhorn" title="Code">💻</a></td>
     </tr>
   </tbody>
 </table>
@@ -303,5 +115,3 @@ Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/d
 <!-- prettier-ignore-end -->
 
 <!-- ALL-CONTRIBUTORS-LIST:END -->
-
-This project follows the [all-contributors](https://github.com/all-contributors/all-contributors) specification. Contributions of any kind welcome!

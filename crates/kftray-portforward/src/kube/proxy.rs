@@ -1,0 +1,1454 @@
+use std::{
+    collections::HashMap,
+    sync::{
+        PoisonError,
+        RwLock,
+    },
+    time::{
+        SystemTime,
+        UNIX_EPOCH,
+    },
+};
+
+use dashmap::{
+    DashMap,
+    mapref::entry::Entry,
+};
+use futures::{
+    StreamExt,
+    stream,
+};
+use k8s_openapi::api::{
+    apps::v1::Deployment,
+    core::v1::{
+        Pod,
+        PodSpec,
+        Probe,
+        TCPSocketAction,
+    },
+};
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+use kftray_commons::{
+    models::{
+        config_model::Config,
+        response::CustomResponse,
+    },
+    utils::{
+        db_mode::DatabaseMode,
+        manifests::{
+            pod_manifest_is_customized,
+            pod_manifest_template,
+            proxy_deployment_manifest_exists,
+            proxy_deployment_manifest_template,
+        },
+    },
+};
+use kftray_telemetry::Phase;
+use kube::Client;
+use kube::api::{
+    Api,
+    DeleteParams,
+    PostParams,
+};
+use kube_runtime::WatchStreamExt;
+use log::{
+    debug,
+    error,
+    info,
+};
+use rand::distr::{
+    Alphanumeric,
+    SampleString,
+};
+use tokio_util::sync::CancellationToken;
+
+use crate::kube::shared_client::{
+    SHARED_CLIENT_MANAGER,
+    ServiceClientKey,
+};
+
+pub(super) static STARTING_PROXIES: std::sync::LazyLock<DashMap<i64, CancellationToken>> =
+    std::sync::LazyLock::new(DashMap::new);
+
+static EXITING: RwLock<bool> = RwLock::new(false);
+
+pub fn close_startup_gate() {
+    *EXITING.write().unwrap_or_else(PoisonError::into_inner) = true;
+}
+
+pub struct ReopenStartupGate;
+
+impl Drop for ReopenStartupGate {
+    fn drop(&mut self) {
+        *EXITING.write().unwrap_or_else(PoisonError::into_inner) = false;
+    }
+}
+
+pub(super) struct PendingStart {
+    id: i64,
+    cancellation: CancellationToken,
+}
+
+impl PendingStart {
+    pub(super) fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+}
+
+impl PendingStart {
+    fn new(id: i64) -> Result<Self, String> {
+        let exiting = EXITING.read().unwrap_or_else(PoisonError::into_inner);
+        if *exiting {
+            return Err(format!(
+                "Startup cancelled for config {id}: kftray is exiting"
+            ));
+        }
+        match STARTING_PROXIES.entry(id) {
+            Entry::Occupied(_) => Err(format!("Startup is already in progress for config {id}")),
+            Entry::Vacant(entry) => {
+                let cancellation = CancellationToken::new();
+                entry.insert(cancellation.clone());
+                Ok(Self { id, cancellation })
+            }
+        }
+    }
+}
+
+impl Drop for PendingStart {
+    fn drop(&mut self) {
+        STARTING_PROXIES.remove(&self.id);
+        crate::kube::proxy_recovery::remove_recovery_lock(self.id);
+    }
+}
+
+/// Name prefix shared by every proxy resource this user creates. Config ids come
+/// from a local database and are not unique inside a namespace, so anything that
+/// selects resources by `config_id` must also match this prefix.
+///
+/// The username is reduced to at most 16 ASCII alphanumeric characters: the
+/// full name is also used as an `app` label value, which Kubernetes caps at 63
+/// characters and restricts to ASCII, so a long or non-ASCII username would
+/// make every create request fail.
+pub fn proxy_resource_prefix() -> String {
+    let username: String = whoami::username()
+        .unwrap_or_else(|_| "unknown".to_string())
+        .to_lowercase()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(16)
+        .collect();
+    format!("kftray-forward-{username}-")
+}
+
+/// Label carried by every proxy resource this installation creates.
+pub const INSTALLATION_LABEL: &str = "installation_id";
+
+/// Selector that matches only this installation's resources for `config_id`.
+/// Two machines can hold the same local config id under the same username, so
+/// `config_id` alone is not an ownership test.
+pub(crate) async fn proxy_owner_selector(
+    config_id: &str, mode: DatabaseMode,
+) -> Result<String, String> {
+    Ok(format!(
+        "config_id={config_id},{INSTALLATION_LABEL}={}",
+        kftray_commons::utils::config_dir::owner_identity(mode).await?
+    ))
+}
+
+pub(crate) async fn tag_installation(
+    labels: &mut Option<std::collections::BTreeMap<String, String>>, mode: DatabaseMode,
+) -> Result<(), String> {
+    labels
+        .get_or_insert_with(std::collections::BTreeMap::new)
+        .insert(
+            INSTALLATION_LABEL.to_owned(),
+            kftray_commons::utils::config_dir::owner_identity(mode).await?,
+        );
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ProxyStartOptions<'a> {
+    mode: DatabaseMode,
+    ssl_override: bool,
+    cancellation: &'a CancellationToken,
+    /// The API server the client resolved to, kept with the cleanup record.
+    destination: &'a str,
+}
+
+pub async fn deploy_and_forward_pod(configs: Vec<Config>) -> Result<Vec<CustomResponse>, String> {
+    deploy_and_forward_pod_with_mode(configs, DatabaseMode::File, false).await
+}
+
+pub(super) type RegisteredBatch = (Vec<(Config, PendingStart)>, Vec<(Config, String)>);
+
+/// Registers every config in [`STARTING_PROXIES`] before any work is buffered.
+/// Registration has to be eager: `buffer_unordered` only polls a window of the
+/// batch, and a stop-all that snapshots the map while the tail is still
+/// unpolled would let those configs start after the snapshot.
+pub(super) fn register_start_batch(configs: Vec<Config>) -> RegisteredBatch {
+    let mut queued = Vec::new();
+    let mut rejected = Vec::new();
+    for config in configs {
+        match config.id.ok_or_else(|| "Config has no ID".to_string()) {
+            Ok(id) => match PendingStart::new(id) {
+                Ok(startup) => queued.push((config, startup)),
+                Err(error) => rejected.push((config, error)),
+            },
+            Err(error) => rejected.push((config, error)),
+        }
+    }
+    (queued, rejected)
+}
+
+pub async fn deploy_and_forward_pod_with_mode(
+    configs: Vec<Config>, mode: DatabaseMode, ssl_override: bool,
+) -> Result<Vec<CustomResponse>, String> {
+    let (queued, rejected) = register_start_batch(configs);
+
+    let mut responses: Vec<CustomResponse> = stream::iter(queued)
+        .map(|(config, startup)| async move {
+            match process_single_proxy_config(config.clone(), startup, mode, ssl_override).await {
+                Ok(response) => response,
+                Err(error) => super::start::start_failure_response(&config, error),
+            }
+        })
+        .buffer_unordered(16)
+        .collect()
+        .await;
+    responses.extend(
+        rejected
+            .into_iter()
+            .map(|(config, error)| super::start::start_failure_response(&config, error)),
+    );
+    super::start::finish_start_batch(responses)
+}
+
+async fn process_single_proxy_config(
+    config: Config, startup: PendingStart, mode: DatabaseMode, ssl_override: bool,
+) -> Result<CustomResponse, String> {
+    let id = startup.id;
+
+    let lock = crate::kube::proxy_recovery::acquire_recovery_lock(id).await;
+    let guard = tokio::select! {
+        biased;
+        _ = startup.cancellation.cancelled() => {
+            return Err(format!("Proxy startup cancelled for config {id}"));
+        }
+        guard = lock.lock() => guard,
+    };
+    let shared = kftray_commons::utils::config_dir::lock_config(
+        id,
+        mode,
+        crate::kube::stop::SHARED_LOCK_WAIT,
+    )
+    .await;
+    let result = match &shared {
+        Err(error) => Err(error.clone()),
+        Ok(_) => match verify_start_preconditions(id, mode).await {
+            Err(error) => Err(error),
+            Ok(()) => {
+                start_proxy_config(config, mode, ssl_override, &startup.cancellation, None).await
+            }
+        },
+    };
+    drop(shared);
+    drop(guard);
+    drop(lock);
+    result
+}
+
+/// Duplicate / already-running / other-process / existence checks that gate
+/// a fresh proxy start, shared by a normal start
+/// ([`process_single_proxy_config`]) and a recovery re-deploy
+/// ([`crate::kube::proxy_recovery::recover_bare_pod`]), so both refuse the
+/// same races the same way.
+///
+/// The caller is expected to hold `id`'s config-dir lock (and, for recovery,
+/// its recovery lock) for as long as this check and the start it gates need
+/// to stay valid: re-reading here under that lock means a start that waited
+/// on it cannot create a relay for a row that has since disappeared.
+pub(super) async fn verify_start_preconditions(id: i64, mode: DatabaseMode) -> Result<(), String> {
+    if crate::port_forward::CHILD_PROCESSES.contains_key(&id) {
+        return Err(format!(
+            "Port forwarding is already running for config {id}"
+        ));
+    }
+    if let Some(owner) = crate::kube::stop::running_in_another_process(id, mode).await {
+        return Err(format!(
+            "Config {id} is being forwarded by another kftray process ({owner})"
+        ));
+    }
+    if kftray_commons::utils::config::get_config_with_mode(id, mode)
+        .await
+        .is_err()
+    {
+        return Err(format!("Config {id} no longer exists"));
+    }
+    Ok(())
+}
+
+pub(super) async fn start_proxy_config(
+    mut config: Config, mode: DatabaseMode, ssl_override: bool, cancellation: &CancellationToken,
+    expected_destination: Option<&str>,
+) -> Result<CustomResponse, String> {
+    let protocol = config.protocol.to_ascii_lowercase();
+    if !matches!(protocol.as_str(), "tcp" | "udp") {
+        return Err(format!("Unsupported proxy protocol: {protocol}"));
+    }
+    let client_key = ServiceClientKey::new(config.context.clone(), config.kubeconfig.clone());
+
+    let shared_client = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err("Proxy startup cancelled".to_string()),
+        result = SHARED_CLIENT_MANAGER.get_connection(client_key) => result.map_err(|e| {
+            error!("Failed to get shared Kubernetes client: {e}");
+            e.to_string()
+        })?,
+    };
+    let client = shared_client.client.clone();
+    let destination = crate::kube::client::cluster_identity(&shared_client.cluster_url);
+    // Recovery resolved the context once already and deleted the old relay on
+    // that server; the replacement has to go to the same one.
+    if let Some(expected) = expected_destination
+        && destination != expected
+    {
+        return Err(format!(
+            "Context resolves to {destination} but the relay being replaced was on {expected}"
+        ));
+    }
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+
+    let random_string: String = Alphanumeric
+        .sample_string(&mut rand::rng(), 6)
+        .chars()
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+
+    let hashed_name = format!(
+        "{}{protocol}-{timestamp}-{random_string}",
+        proxy_resource_prefix()
+    )
+    .to_lowercase();
+
+    let config_id_str = config
+        .id
+        .map_or_else(|| "default".into(), |id| id.to_string());
+
+    // A pod configuration names its workload by label selector, which the
+    // relay cannot dial: it gets the IP of a ready pod behind that selector,
+    // resolved now and again on every re-deployment. `remote_address` records
+    // the address the running relay was given, so the target watch can tell
+    // when that pod is gone.
+    let remote_address = if config.workload_type.as_deref() == Some("pod") {
+        let pods: Api<Pod> = Api::namespaced(client.clone(), &config.namespace);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err("Proxy startup cancelled".to_string()),
+            resolved = resolve_target_pod_ip(&pods, config.target.as_deref().unwrap_or_default()) => resolved?,
+        }
+    } else {
+        explicit_remote_address(config.remote_address.take())
+            .or_else(|| config.service.clone().filter(|service| !service.is_empty()))
+            .ok_or("A proxy destination address or service is required")?
+    };
+    let remote_port = config
+        .remote_port
+        .filter(|port| *port > 0)
+        .ok_or("A proxy destination port is required")?;
+    let service_name = config
+        .service
+        .clone()
+        .filter(|service| !service.is_empty())
+        .unwrap_or_else(|| remote_address.clone());
+    config.remote_address = Some(remote_address.clone());
+
+    let mut values: HashMap<String, String> = HashMap::new();
+    values.insert("hashed_name".to_string(), hashed_name.clone());
+    values.insert("config_id".to_string(), config_id_str.clone());
+    values.insert("service_name".to_string(), service_name);
+    values.insert("remote_address".to_string(), remote_address);
+    values.insert("remote_port".to_string(), remote_port.to_string());
+    values.insert("local_port".to_string(), remote_port.to_string());
+    values.insert("protocol".to_string(), protocol.clone());
+
+    let use_deployment = should_use_deployment_manifest();
+    let options = ProxyStartOptions {
+        mode,
+        ssl_override,
+        cancellation,
+        destination: &destination,
+    };
+
+    if use_deployment {
+        process_deployment_proxy(
+            client,
+            &mut config,
+            &hashed_name,
+            &config_id_str,
+            &values,
+            &protocol,
+            options,
+        )
+        .await
+    } else {
+        process_pod_proxy(
+            client,
+            &mut config,
+            &hashed_name,
+            &values,
+            &protocol,
+            options,
+        )
+        .await
+    }
+}
+
+fn relay_container_index(spec: &PodSpec) -> Option<usize> {
+    spec.containers.iter().position(|container| {
+        container
+            .env
+            .as_ref()
+            .is_some_and(|env| env.iter().any(|variable| variable.name == "LOCAL_PORT"))
+    })
+}
+
+pub(crate) fn relay_container_name(spec: &PodSpec) -> Option<String> {
+    let index = relay_container_index(spec)?;
+    spec.containers
+        .get(index)
+        .map(|container| container.name.clone())
+}
+
+/// Adds a startup probe to the relay container and returns its name.
+///
+/// A customized manifest is left alone: the probe is a kubelet TCP check
+/// against the pod IP, and a custom relay may only listen on loopback inside
+/// the pod, which the port forward can still reach but the probe cannot.
+fn prepare_relay_startup(
+    spec: &mut PodSpec, port: u16, customized: bool,
+) -> Result<String, String> {
+    let index = relay_container_index(spec).ok_or_else(|| {
+        "No container declares a LOCAL_PORT environment variable (a customized proxy \
+         manifest may be missing it); add LOCAL_PORT to the relay container so kftray can \
+         attach its startup probe"
+            .to_string()
+    })?;
+    let container = spec
+        .containers
+        .get_mut(index)
+        .ok_or("Proxy manifest must contain a container")?;
+    if customized {
+        return Ok(container.name.clone());
+    }
+    container.startup_probe.get_or_insert_with(|| Probe {
+        tcp_socket: Some(TCPSocketAction {
+            port: IntOrString::Int(i32::from(port)),
+            ..Default::default()
+        }),
+        period_seconds: Some(1),
+        timeout_seconds: Some(1),
+        failure_threshold: Some(30),
+        ..Default::default()
+    });
+    Ok(container.name.clone())
+}
+
+/// Whether the relay container has started.
+///
+/// A customized manifest gets no startup probe (see [`prepare_relay_startup`]),
+/// and some kubelets omit `started` entirely rather than reporting it `Some(true)`
+/// once a container with no startup probe is running. Falling back to
+/// `Running` + container-ready only for that case avoids waiting forever on a
+/// field the kubelet never sets, without loosening the check for a manifest
+/// that does have a probe attached.
+pub(crate) fn relay_started(pod: Option<&Pod>, container_name: &str, customized: bool) -> bool {
+    pod.is_some_and(|pod| {
+        pod.metadata.deletion_timestamp.is_none()
+            && pod.status.as_ref().is_some_and(|status| {
+                status.phase.as_deref() == Some("Running")
+                    && status
+                        .container_statuses
+                        .as_ref()
+                        .is_some_and(|containers| {
+                            containers.iter().any(|container| {
+                                if container.name != container_name {
+                                    return false;
+                                }
+                                match container.started {
+                                    Some(started) => started,
+                                    None if customized => container.ready,
+                                    None => false,
+                                }
+                            })
+                        })
+            })
+    })
+}
+
+/// The IP of `pod` when it can take traffic: running, not being deleted,
+/// and reporting the `Ready` condition.
+pub(crate) fn ready_pod_ip(pod: &Pod) -> Option<&str> {
+    if pod.metadata.deletion_timestamp.is_some() {
+        return None;
+    }
+    let status = pod.status.as_ref()?;
+    if status.phase.as_deref() != Some("Running") {
+        return None;
+    }
+    let ready = status.conditions.as_ref().is_some_and(|conditions| {
+        conditions
+            .iter()
+            .any(|condition| condition.type_ == "Ready" && condition.status == "True")
+    });
+    if !ready {
+        return None;
+    }
+    status.pod_ip.as_deref().filter(|ip| !ip.is_empty())
+}
+
+/// Picks the pod a pod-targeted relay dials: the first ready pod among
+/// `pods`, by name, so repeated resolutions against an unchanged set of
+/// pods agree.
+pub(crate) fn select_target_pod_ip<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> Option<String> {
+    let mut ready: Vec<(&str, &str)> = pods
+        .into_iter()
+        .filter_map(|pod| {
+            let ip = ready_pod_ip(pod)?;
+            Some((pod.metadata.name.as_deref().unwrap_or_default(), ip))
+        })
+        .collect();
+    ready.sort_unstable();
+    ready.first().map(|(_, ip)| (*ip).to_owned())
+}
+
+async fn resolve_target_pod_ip(pods: &Api<Pod>, label_selector: &str) -> Result<String, String> {
+    if label_selector.trim().is_empty() {
+        return Err("Pod configuration has no label selector".to_string());
+    }
+    let list = pods
+        .list(&kube::api::ListParams::default().labels(label_selector))
+        .await
+        .map_err(|error| format!("Failed to list pods matching '{label_selector}': {error}"))?;
+    select_target_pod_ip(&list.items).ok_or_else(|| {
+        format!(
+            "{} matching '{label_selector}'",
+            crate::kube::target::NO_READY_PODS_ERROR
+        )
+    })
+}
+
+async fn wait_for_relay_startup(
+    pods: &Api<Pod>, pod_name: &str, container_name: &str, customized: bool,
+    cancellation: &CancellationToken,
+) -> Result<(), String> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err("Proxy startup cancelled".to_string()),
+        result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            kube_runtime::wait::await_condition(pods.clone(), pod_name, move |pod: Option<&Pod>| {
+                relay_started(pod, container_name, customized)
+            }),
+        ) => result
+            .map_err(|_| format!("Timed out waiting for proxy listener in pod {pod_name}"))?
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+    }
+}
+
+async fn process_deployment_proxy(
+    client: Client, config: &mut Config, hashed_name: &str, config_id_str: &str,
+    values: &HashMap<String, String>, protocol: &str, options: ProxyStartOptions<'_>,
+) -> Result<CustomResponse, String> {
+    let contents = proxy_deployment_manifest_template()?;
+
+    let rendered_json = render_json_template_owned(&contents, values);
+    let mut deployment: Deployment =
+        serde_json::from_str(&rendered_json).map_err(|e| e.to_string())?;
+    tag_installation(&mut deployment.metadata.labels, options.mode).await?;
+    if let Some(spec) = deployment.spec.as_mut() {
+        tag_installation(&mut spec.selector.match_labels, options.mode).await?;
+        tag_installation(
+            &mut spec.template.metadata.get_or_insert_default().labels,
+            options.mode,
+        )
+        .await?;
+    }
+    let spec = deployment
+        .spec
+        .as_mut()
+        .and_then(|spec| spec.template.spec.as_mut())
+        .ok_or("Proxy deployment must contain a pod specification")?;
+    let customized = kftray_commons::utils::manifests::deployment_manifest_is_customized();
+    let container_name = prepare_relay_startup(
+        spec,
+        config
+            .remote_port
+            .ok_or("A proxy destination port is required")?,
+        customized,
+    )?;
+    if options.cancellation.is_cancelled() {
+        return Err("Proxy startup cancelled".to_string());
+    }
+
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), &config.namespace);
+
+    // Armed before the request: the API server can create the resource and
+    // still leave us without a response, and a dropped startup future never
+    // reaches the rollback below.
+    let mut guard = crate::kube::stop::ClusterResourceGuard::arm(
+        config.id.unwrap_or_default(),
+        Config {
+            service: Some(hashed_name.to_string()),
+            ..config.clone()
+        },
+        Some(options.destination.to_owned()),
+        options.mode,
+    )
+    .await?;
+    // Deliberately not raced against cancellation: abandoning a create in
+    // flight leaves an unknown outcome, and a cleanup pass that lists before
+    // the object is persisted would forget it. Bounded instead, so a stalled
+    // request still releases the lifecycle lock.
+    let phase = kftray_telemetry::phase(Phase::RelayDeploy);
+    let outcome = create_proxy_resource(&deployments, &deployment).await;
+    drop(phase);
+    match outcome {
+        CreateOutcome::Settled(Ok(())) => guard.confirm(),
+        // A definitive rejection means nothing was created, so there is nothing
+        // for a later cleanup pass to find.
+        CreateOutcome::Settled(Err(error)) => {
+            guard.disarm().await;
+            return Err(error);
+        }
+        // No answer: the object may still appear, so the record stays uncertain
+        // and a later cleanup pass retries it.
+        CreateOutcome::Unknown(error) => return Err(error),
+    }
+    let result: Result<CustomResponse, String> = async {
+        let pods: Api<Pod> = Api::namespaced(client, &config.namespace);
+        let label_selector = format!(
+            "app={hashed_name},{}",
+            proxy_owner_selector(config_id_str, options.mode).await?
+        );
+        let phase = kftray_telemetry::phase(Phase::RelayWait);
+        wait_for_relay_pod(
+            &pods,
+            &label_selector,
+            &container_name,
+            customized,
+            options.cancellation,
+        )
+        .await?;
+        drop(phase);
+        config.service = Some(hashed_name.to_string());
+        let response = super::start::start_config_cancellable(
+            config.clone(),
+            protocol,
+            options.mode,
+            options.ssl_override,
+            Some(options.cancellation),
+            Some(options.destination.to_owned()),
+        )
+        .await
+        .map_err(|error| format!("Failed to start port forwarding: {error}"))?;
+        crate::kube::proxy_recovery::spawn_recovery_manager(
+            config.clone(),
+            crate::kube::proxy_recovery::ProxyType::Deployment,
+            options.mode,
+            options.ssl_override,
+            options.destination.to_owned(),
+        );
+        Ok(response)
+    }
+    .await;
+    if let Err(error) = result {
+        match delete_proxy_resource(&deployments, hashed_name).await {
+            Ok(()) => guard.disarm().await,
+            Err(cleanup) => {
+                // The guard stays armed so stop-all retries this deletion.
+                return Err(format!(
+                    "{error}; failed to delete proxy deployment: {cleanup}"
+                ));
+            }
+        }
+        return Err(error);
+    }
+    drop(guard);
+    result
+}
+
+/// The outcome of a create request.
+enum CreateOutcome {
+    /// The API server answered: the resource exists, or it definitively
+    /// rejected the request.
+    Settled(Result<(), String>),
+    /// The client stopped waiting, or the transport failed. The API server may
+    /// still persist the object, so the cleanup record must stay uncertain.
+    Unknown(String),
+}
+
+/// Creates one proxy resource under a deadline.
+async fn create_proxy_resource<K>(api: &Api<K>, resource: &K) -> CreateOutcome
+where
+    K: Clone + serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug,
+{
+    const CREATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    match tokio::time::timeout(CREATE_TIMEOUT, api.create(&PostParams::default(), resource)).await {
+        Ok(Ok(_)) => CreateOutcome::Settled(Ok(())),
+        // Only a definitive rejection proves the object was not created. A
+        // server-side timeout or an unavailable API server can be answered
+        // while the request is still being applied.
+        Ok(Err(kube::Error::Api(response))) => {
+            if matches!(response.code, 408 | 429 | 500 | 502 | 503 | 504) {
+                CreateOutcome::Unknown(response.message.clone())
+            } else {
+                CreateOutcome::Settled(Err(response.message.clone()))
+            }
+        }
+        Ok(Err(error)) => CreateOutcome::Unknown(error.to_string()),
+        Err(_) => CreateOutcome::Unknown("Timed out creating the proxy resource".to_string()),
+    }
+}
+
+/// Deletes one proxy resource under a deadline. Rollback must not inherit the
+/// stall that caused the failure: the lifecycle lock is still held and a stop
+/// is waiting on it.
+async fn delete_proxy_resource<K>(api: &Api<K>, name: &str) -> Result<(), String>
+where
+    K: Clone + serde::de::DeserializeOwned + std::fmt::Debug,
+{
+    const ROLLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+    let dp = DeleteParams {
+        grace_period_seconds: Some(0),
+        ..DeleteParams::default()
+    };
+    match tokio::time::timeout(ROLLBACK_TIMEOUT, api.delete(name, &dp)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(kube::Error::Api(response))) if response.code == 404 => Ok(()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err(format!("timed out deleting {name}")),
+    }
+}
+
+async fn wait_for_relay_pod(
+    pods: &Api<Pod>, label_selector: &str, container_name: &str, customized: bool,
+    cancellation: &CancellationToken,
+) -> Result<String, String> {
+    let watcher = kube_runtime::watcher(
+        pods.clone(),
+        kube_runtime::watcher::Config::default().labels(label_selector),
+    )
+    .default_backoff()
+    .applied_objects();
+    futures::pin_mut!(watcher);
+    let result = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err("Proxy startup cancelled".to_string()),
+        result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            async {
+                while let Some(event) = watcher.next().await {
+                    let pod = match event {
+                        Ok(pod) => pod,
+                        Err(error) => {
+                            debug!("Retrying the proxy relay pod watch: {error}");
+                            continue;
+                        }
+                    };
+                    if relay_started(Some(&pod), container_name, customized) {
+                        return pod
+                            .metadata
+                            .name
+                            .ok_or_else(|| "Proxy pod has no name".to_string());
+                    }
+                }
+                Err("Proxy pod watch ended before the relay started".to_string())
+            },
+        ) => result,
+    };
+    match result {
+        Ok(result) => result,
+        Err(_) => Err("Timed out waiting for the proxy deployment relay to start".to_string()),
+    }
+}
+
+async fn process_pod_proxy(
+    client: Client, config: &mut Config, hashed_name: &str, values: &HashMap<String, String>,
+    protocol: &str, options: ProxyStartOptions<'_>,
+) -> Result<CustomResponse, String> {
+    let contents = pod_manifest_template()?;
+
+    let rendered_json = render_json_template_owned(&contents, values);
+    let mut pod: Pod = serde_json::from_str(&rendered_json).map_err(|e| e.to_string())?;
+    tag_installation(&mut pod.metadata.labels, options.mode).await?;
+    let spec = pod
+        .spec
+        .as_mut()
+        .ok_or("Proxy pod must contain a pod specification")?;
+    let customized = pod_manifest_is_customized();
+    let container_name = prepare_relay_startup(
+        spec,
+        config
+            .remote_port
+            .ok_or("A proxy destination port is required")?,
+        customized,
+    )?;
+    if options.cancellation.is_cancelled() {
+        return Err("Proxy startup cancelled".to_string());
+    }
+
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &config.namespace);
+
+    let mut guard = crate::kube::stop::ClusterResourceGuard::arm(
+        config.id.unwrap_or_default(),
+        Config {
+            service: Some(hashed_name.to_string()),
+            ..config.clone()
+        },
+        Some(options.destination.to_owned()),
+        options.mode,
+    )
+    .await?;
+    let phase = kftray_telemetry::phase(Phase::RelayDeploy);
+    let outcome = create_proxy_resource(&pods, &pod).await;
+    drop(phase);
+    match outcome {
+        CreateOutcome::Settled(Ok(())) => guard.confirm(),
+        CreateOutcome::Settled(Err(error)) => {
+            guard.disarm().await;
+            return Err(error);
+        }
+        CreateOutcome::Unknown(error) => return Err(error),
+    }
+    let result: Result<CustomResponse, String> = async {
+        let phase = kftray_telemetry::phase(Phase::RelayWait);
+        wait_for_relay_startup(
+            &pods,
+            hashed_name,
+            &container_name,
+            customized,
+            options.cancellation,
+        )
+        .await?;
+        drop(phase);
+        config.service = Some(hashed_name.to_string());
+        let response = super::start::start_config_cancellable(
+            config.clone(),
+            protocol,
+            options.mode,
+            options.ssl_override,
+            Some(options.cancellation),
+            Some(options.destination.to_owned()),
+        )
+        .await
+        .map_err(|error| format!("Failed to start port forwarding: {error}"))?;
+        crate::kube::proxy_recovery::spawn_recovery_manager(
+            config.clone(),
+            crate::kube::proxy_recovery::ProxyType::BarePod,
+            options.mode,
+            options.ssl_override,
+            options.destination.to_owned(),
+        );
+        Ok(response)
+    }
+    .await;
+    if let Err(error) = result {
+        match delete_proxy_resource(&pods, hashed_name).await {
+            Ok(()) => guard.disarm().await,
+            Err(cleanup) => {
+                // The guard stays armed so stop-all retries this deletion.
+                return Err(format!("{error}; failed to delete proxy pod: {cleanup}"));
+            }
+        }
+        return Err(error);
+    }
+    drop(guard);
+    result
+}
+
+pub async fn stop_proxy_forward_with_mode(
+    config_id: i64, _namespace: &str, service_name: String,
+    mode: kftray_commons::utils::db_mode::DatabaseMode,
+) -> Result<CustomResponse, String> {
+    info!("Stopping proxy forward for service: {service_name}");
+    super::stop::stop_port_forward_with_mode(config_id.to_string(), mode)
+        .await
+        .map_err(|e| {
+            error!("Failed to stop port forwarding for service '{service_name}': {e}");
+            e
+        })
+}
+
+pub async fn stop_proxy_forward(
+    config_id: i64, _namespace: &str, service_name: String,
+) -> Result<CustomResponse, String> {
+    info!("Stopping proxy forward for service: {service_name}");
+    super::stop::stop_port_forward_with_mode(
+        config_id.to_string(),
+        kftray_commons::utils::db_mode::DatabaseMode::File,
+    )
+    .await
+    .map_err(|e| {
+        error!("Failed to stop port forwarding for service '{service_name}': {e}");
+        e
+    })
+}
+
+fn explicit_remote_address(address: Option<String>) -> Option<String> {
+    address.filter(|address| !address.is_empty() && address != Config::DEFAULT_REMOTE_ADDRESS)
+}
+
+fn should_use_deployment_manifest() -> bool {
+    if pod_manifest_is_customized() {
+        info!("Using legacy Pod manifest (custom detected)");
+        return false;
+    }
+
+    if proxy_deployment_manifest_exists() {
+        info!("Using new Deployment manifest");
+        return true;
+    }
+
+    info!("Using legacy Pod manifest (Deployment not available)");
+    false
+}
+
+fn render_json_template_owned(template: &str, values: &HashMap<String, String>) -> String {
+    let mut rendered_template = template.to_string();
+
+    for (key, value) in values.iter() {
+        rendered_template = rendered_template.replace(&format!("{{{key}}}"), value);
+    }
+
+    rendered_template
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use kftray_commons::models::config_model::Config;
+
+    use super::*;
+
+    #[test]
+    fn only_the_injected_sentinel_and_empty_addresses_are_dropped() {
+        assert_eq!(explicit_remote_address(None), None);
+        assert_eq!(explicit_remote_address(Some(String::new())), None);
+        assert_eq!(
+            explicit_remote_address(Some(Config::DEFAULT_REMOTE_ADDRESS.to_string())),
+            None
+        );
+        for host in [
+            "protocol",
+            "default-service",
+            "current-context",
+            "db.internal",
+        ] {
+            assert_eq!(
+                explicit_remote_address(Some(host.to_string())).as_deref(),
+                Some(host)
+            );
+        }
+    }
+
+    #[test]
+    fn every_batch_config_registers_before_any_is_buffered() {
+        let _lock = crate::port_forward::PROCESS_TEST_MUTEX.blocking_lock();
+        let ids: Vec<i64> = (930_100..930_130).collect();
+        let configs: Vec<Config> = ids
+            .iter()
+            .map(|id| Config {
+                id: Some(*id),
+                ..Default::default()
+            })
+            .collect();
+
+        let (queued, errors) = register_start_batch(configs);
+
+        assert!(errors.is_empty());
+        assert_eq!(queued.len(), ids.len());
+        for id in &ids {
+            assert!(
+                STARTING_PROXIES.contains_key(id),
+                "config {id} must be cancellable by stop-all before its turn in the buffer"
+            );
+        }
+        drop(queued);
+        for id in &ids {
+            assert!(!STARTING_PROXIES.contains_key(id));
+        }
+    }
+
+    #[test]
+    fn test_render_json_template_owned() {
+        let template = r#"{
+            "name": "{hashed_name}",
+            "config_id": "{config_id}",
+            "service": "{service_name}",
+            "port": {remote_port}
+        }"#;
+
+        let mut values = HashMap::new();
+        values.insert("hashed_name".to_string(), "test-pod".to_string());
+        values.insert("config_id".to_string(), "123".to_string());
+        values.insert("service_name".to_string(), "test-service".to_string());
+        values.insert("remote_port".to_string(), "8080".to_string());
+
+        let rendered = render_json_template_owned(template, &values);
+
+        assert!(rendered.contains("\"name\": \"test-pod\""));
+        assert!(rendered.contains("\"config_id\": \"123\""));
+        assert!(rendered.contains("\"service\": \"test-service\""));
+        assert!(rendered.contains("\"port\": 8080"));
+    }
+
+    #[test]
+    fn test_render_json_template_owned_with_missing_values() {
+        let template = r#"{
+            "name": "{hashed_name}",
+            "config_id": "{config_id}",
+            "missing": "{missing_value}"
+        }"#;
+
+        let mut values = HashMap::new();
+        values.insert("hashed_name".to_string(), "test-pod".to_string());
+        values.insert("config_id".to_string(), "123".to_string());
+
+        let rendered = render_json_template_owned(template, &values);
+
+        assert!(rendered.contains("\"name\": \"test-pod\""));
+        assert!(rendered.contains("\"config_id\": \"123\""));
+        assert!(rendered.contains("\"missing\": \"{missing_value}\""));
+    }
+
+    #[test]
+    fn test_render_json_template_owned_with_empty_values() {
+        let template = r#"{"name": "{hashed_name}"}"#;
+        let values = HashMap::new();
+
+        let rendered = render_json_template_owned(template, &values);
+        assert_eq!(rendered, r#"{"name": "{hashed_name}"}"#);
+    }
+
+    #[test]
+    fn test_render_json_template_owned_complex() {
+        let template = r#"{
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "{hashed_name}",
+                "labels": {
+                    "app": "kftray-forward",
+                    "config_id": "{config_id}"
+                }
+            },
+            "spec": {
+                "containers": [
+                    {
+                        "name": "proxy",
+                        "image": "alpine:latest",
+                        "command": ["/bin/sh"],
+                        "args": ["-c", "while true; do sleep 60; done"],
+                        "ports": [
+                            {
+                                "containerPort": {remote_port},
+                                "protocol": "{protocol}"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }"#;
+
+        let mut values = HashMap::new();
+        values.insert("hashed_name".to_string(), "test-pod-abc123".to_string());
+        values.insert("config_id".to_string(), "456".to_string());
+        values.insert("remote_port".to_string(), "9090".to_string());
+        values.insert("protocol".to_string(), "TCP".to_string());
+
+        let rendered = render_json_template_owned(template, &values);
+
+        assert!(rendered.contains("\"name\": \"test-pod-abc123\""));
+        assert!(rendered.contains("\"config_id\": \"456\""));
+        assert!(rendered.contains("\"containerPort\": 9090"));
+        assert!(rendered.contains("\"protocol\": \"TCP\""));
+    }
+
+    #[tokio::test]
+    async fn test_deploy_and_forward_pod_empty_config() {
+        let configs = Vec::new();
+
+        let result = deploy_and_forward_pod(configs).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_deploy_and_forward_pod_invalid_kubeconfig() {
+        let _db = kftray_commons::test_utils::test_db().await;
+        let _lock = crate::port_forward::PROCESS_TEST_MUTEX.lock().await;
+        let config = Config {
+            id: Some(1),
+            context: Some("invalid-context".to_string()),
+            kubeconfig: Some("invalid-kubeconfig".to_string()),
+            namespace: "default".to_string(),
+            service: Some("test-service".to_string()),
+            alias: None,
+            local_port: Some(8080),
+            remote_port: Some(8080),
+            protocol: "tcp".to_string(),
+            workload_type: Some("service".to_string()),
+            target: None,
+            local_address: None,
+            auto_loopback_address: false,
+            remote_address: None,
+            domain_enabled: None,
+            http_logs_enabled: Some(false),
+            http_logs_max_file_size: Some(10 * 1024 * 1024),
+            http_logs_retention_days: Some(7),
+            http_logs_auto_cleanup: Some(true),
+            exposure_type: None,
+            exposure_protocol: None,
+            cert_manager_enabled: None,
+            cert_issuer: None,
+            cert_issuer_kind: None,
+            ingress_class: None,
+            ingress_annotations: None,
+            tags: Default::default(),
+        };
+
+        // The batch has a single config and it fails, so the batch is
+        // all-failed: `deploy_and_forward_pod` must reject it instead of
+        // returning `Ok` with a single failed response (finding 29).
+        let error = deploy_and_forward_pod(vec![config]).await.unwrap_err();
+        assert!(!error.is_empty());
+    }
+
+    #[test]
+    fn running_relay_waits_for_listener_startup() {
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "relay"},
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [{
+                    "name": "relay", "started": false, "ready": false,
+                    "restartCount": 0, "image": "relay", "imageID": "relay"
+                }]
+            }
+        }))
+        .unwrap();
+        assert!(!relay_started(Some(&pod), "relay", false));
+    }
+
+    #[test]
+    fn started_relay_does_not_require_sidecar_readiness() {
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "relay"},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "False"}],
+                "containerStatuses": [
+                    {"name": "relay", "started": true, "ready": true,
+                     "restartCount": 0, "image": "relay", "imageID": "relay"},
+                    {"name": "sidecar", "started": true, "ready": false,
+                     "restartCount": 0, "image": "sidecar", "imageID": "sidecar"}
+                ]
+            }
+        }))
+        .unwrap();
+        assert!(relay_started(Some(&pod), "relay", false));
+    }
+
+    #[test]
+    fn a_customized_manifest_with_no_started_field_falls_back_to_readiness() {
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "relay"},
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [{
+                    "name": "relay", "ready": true,
+                    "restartCount": 0, "image": "relay", "imageID": "relay"
+                }]
+            }
+        }))
+        .unwrap();
+        // No startup probe was injected for a customized manifest, and some
+        // kubelets omit `started` entirely for a container that never had
+        // one to report on; a running, ready container still counts.
+        assert!(relay_started(Some(&pod), "relay", true));
+        assert!(
+            !relay_started(Some(&pod), "relay", false),
+            "a manifest that did get a startup probe must not skip waiting for `started`"
+        );
+    }
+
+    #[test]
+    fn a_customized_manifest_with_no_started_field_and_not_ready_keeps_waiting() {
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "relay"},
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [{
+                    "name": "relay", "ready": false,
+                    "restartCount": 0, "image": "relay", "imageID": "relay"
+                }]
+            }
+        }))
+        .unwrap();
+        assert!(!relay_started(Some(&pod), "relay", true));
+    }
+
+    #[tokio::test]
+    async fn test_stop_proxy_forward_invalid_config() {
+        let _db = kftray_commons::test_utils::test_db().await;
+        let result = stop_proxy_forward(999, "default", "nonexistent-service".to_string()).await;
+        assert!(result.is_err());
+    }
+
+    async fn assert_startup_wait_is_cancelled(id: i64, listener_wait: bool) {
+        let _isolation = crate::port_forward::PROCESS_TEST_MUTEX.lock().await;
+        let startup = PendingStart::new(id).unwrap();
+        let lock = crate::kube::proxy_recovery::acquire_recovery_lock(id).await;
+        let guard = lock.lock_owned().await;
+        let (service, mut requests) = tower_test::mock::pair::<
+            http::Request<kube::client::Body>,
+            http::Response<kube::client::Body>,
+        >();
+        let pods = Api::namespaced(Client::new(service, "default"), "default");
+        let waiter = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            let _guard = guard;
+            if listener_wait {
+                wait_for_relay_startup(&pods, "relay", "relay", false, &startup.cancellation).await
+            } else {
+                wait_for_relay_pod(&pods, "app=relay", "relay", false, &startup.cancellation)
+                    .await
+                    .map(|_| ())
+            }
+        }));
+        let (_request, _pending_response) = requests.next_request().await.unwrap();
+        if listener_wait {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                crate::kube::stop_port_forward_with_mode(id.to_string(), DatabaseMode::Memory),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_err());
+        } else {
+            let responses = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                crate::kube::stop_all_port_forward_with_mode(DatabaseMode::Memory),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(responses.iter().any(|response| response.id == Some(id)));
+        }
+        assert!(waiter.await.unwrap().is_err());
+        assert!(!STARTING_PROXIES.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn stop_all_cancels_proxy_pod_discovery() {
+        let _db = kftray_commons::test_utils::test_db().await;
+        assert_startup_wait_is_cancelled(420_001, false).await;
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_proxy_listener_readiness() {
+        let _db = kftray_commons::test_utils::test_db().await;
+        assert_startup_wait_is_cancelled(420_002, true).await;
+    }
+
+    #[tokio::test]
+    async fn relay_discovery_skips_pods_whose_relay_has_not_started() {
+        let (service, mut requests) = tower_test::mock::pair::<
+            http::Request<kube::client::Body>,
+            http::Response<kube::client::Body>,
+        >();
+        let pods = Api::namespaced(Client::new(service, "default"), "default");
+        let started = serde_json::json!({
+            "phase": "Running",
+            "containerStatuses": [{
+                "name": "relay", "started": true, "ready": true,
+                "restartCount": 0, "image": "relay", "imageID": "relay"
+            }]
+        });
+        let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            let (_, send) = requests.next_request().await.unwrap();
+            send.send_response(http::Response::builder().body(kube::client::Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "metadata":{"resourceVersion":"1"},
+                    "items":[
+                        {"metadata":{"name":"terminating-pod","deletionTimestamp":"2026-09-11T00:00:00Z"},
+                         "status": started},
+                        {"metadata":{"name":"scheduling-pod"},"status":{"phase":"Pending"}},
+                        {"metadata":{"name":"replacement-pod"},"status": started}
+                    ]
+                })).unwrap()
+            )).unwrap());
+        }));
+        let cancellation = CancellationToken::new();
+        let selected = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_for_relay_pod(&pods, "app=relay", "relay", false, &cancellation),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected, "replacement-pod");
+        server.await.unwrap();
+    }
+
+    fn registered_config(id: i64) -> Config {
+        Config {
+            id: Some(id),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_exit_cancels_earlier_starts_and_refuses_later_ones() {
+        let _db = kftray_commons::test_utils::test_db().await;
+        let _lock = crate::port_forward::PROCESS_TEST_MUTEX.lock().await;
+        let _reopen = ReopenStartupGate;
+        let early = [930_200, 930_201, 930_202];
+        let (queued, rejected) =
+            register_start_batch(early.iter().copied().map(registered_config).collect());
+        assert!(rejected.is_empty());
+        for (_, startup) in &queued {
+            assert!(!startup.cancellation().is_cancelled());
+        }
+
+        close_startup_gate();
+        let (before_snapshot, rejected_before_snapshot) =
+            register_start_batch(vec![registered_config(930_210)]);
+        let (responses, unfinished) = crate::kube::stop::stop_all_port_forward_with_deadline(
+            DatabaseMode::Memory,
+            &std::collections::HashSet::new(),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let (after_snapshot, rejected_after_snapshot) =
+            register_start_batch(vec![registered_config(930_211)]);
+
+        for (_, startup) in &queued {
+            assert!(startup.cancellation().is_cancelled());
+        }
+        for id in early {
+            assert!(responses.iter().any(|response| response.id == Some(id)));
+        }
+        assert!(unfinished.is_empty());
+        assert!(before_snapshot.is_empty());
+        assert!(after_snapshot.is_empty());
+        for (config, error) in rejected_before_snapshot
+            .iter()
+            .chain(&rejected_after_snapshot)
+        {
+            assert!(error.contains("kftray is exiting"), "{error}");
+            assert!(!STARTING_PROXIES.contains_key(&config.id.unwrap()));
+        }
+        assert_eq!(rejected_before_snapshot.len(), 1);
+        assert_eq!(rejected_after_snapshot.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refused_starts_reserve_nothing_on_any_entry_path() {
+        let _db = kftray_commons::test_utils::test_db().await;
+        let _lock = crate::port_forward::PROCESS_TEST_MUTEX.lock().await;
+        let _reopen = ReopenStartupGate;
+        let id = 930_300;
+        close_startup_gate();
+
+        let direct = crate::kube::start_port_forward_with_mode(
+            vec![registered_config(id)],
+            "tcp",
+            DatabaseMode::Memory,
+            false,
+        )
+        .await
+        .unwrap_err();
+        let relay = deploy_and_forward_pod_with_mode(
+            vec![registered_config(id)],
+            DatabaseMode::Memory,
+            false,
+        )
+        .await
+        .unwrap_err();
+        let expose = crate::expose::start_expose(vec![registered_config(id)], DatabaseMode::Memory)
+            .await
+            .unwrap_err();
+
+        for error in [direct, relay, expose] {
+            assert!(error.contains("kftray is exiting"), "{error}");
+        }
+        assert!(!STARTING_PROXIES.contains_key(&id));
+        assert!(!crate::kube::proxy_recovery::RECOVERY_LOCKS.contains_key(&id));
+        assert!(!crate::port_forward::CHILD_PROCESSES.contains_key(&id));
+        let states =
+            kftray_commons::utils::config_state::get_configs_state_with_mode(DatabaseMode::Memory)
+                .await
+                .unwrap();
+        assert!(states.iter().all(|state| state.config_id != id));
+    }
+
+    #[test]
+    fn no_start_registers_after_the_gate_closes_while_others_register() {
+        use std::sync::atomic::{
+            AtomicUsize,
+            Ordering,
+        };
+
+        let _lock = crate::port_forward::PROCESS_TEST_MUTEX.blocking_lock();
+        let _reopen = ReopenStartupGate;
+        let registered = AtomicUsize::new(0);
+
+        let (seen_at_close, granted) = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8_i64)
+                .map(|worker| {
+                    let registered = &registered;
+                    scope.spawn(move || {
+                        let mut held = Vec::new();
+                        let mut id = 940_000 + worker * 100_000;
+                        while held.len() < 20_000 {
+                            let Ok(startup) = PendingStart::new(id) else {
+                                break;
+                            };
+                            held.push(startup);
+                            registered.fetch_add(1, Ordering::SeqCst);
+                            id += 1;
+                        }
+                        held
+                    })
+                })
+                .collect();
+            while registered.load(Ordering::SeqCst) < 200 {
+                std::thread::yield_now();
+            }
+            close_startup_gate();
+            let seen_at_close: std::collections::HashSet<i64> =
+                STARTING_PROXIES.iter().map(|entry| *entry.key()).collect();
+            let granted: Vec<PendingStart> = workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect();
+            (seen_at_close, granted)
+        });
+
+        assert!(
+            granted
+                .iter()
+                .all(|startup| seen_at_close.contains(&startup.id))
+        );
+    }
+}

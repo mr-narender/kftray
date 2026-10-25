@@ -1,0 +1,84 @@
+[package]
+name = "kftui"
+version = "0.33.0"
+authors = [
+  "Henrique Cavarsan <hencavarsan@gmail.com>",
+]
+edition = "2024"
+description = "KFtray TUI is a Rust application that manage multiple kubectl port forward configurations"
+homepage = "https://kftray.app"
+repository = "https://github.com/hcavarsan/kftray"
+license = "GPL-3.0"
+build = "build.rs"
+
+[package.metadata.cargo-machete]
+ignored = ["built"]
+
+[dependencies]
+anyhow.workspace = true
+built = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+crossterm = { workspace = true, features = ["osc52"] }
+env_logger = { workspace = true }
+flate2 = { workspace = true }
+futures = { workspace = true }
+kftray-commons = { workspace = true }
+kftray-network-monitor = { workspace = true }
+kftray-portforward = { workspace = true }
+kftray-telemetry = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+ratatui = { workspace = true }
+ratatui-explorer = { workspace = true }
+self-replace = "1.5"
+semver = { workspace = true }
+serde_json = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
+throbber-widgets-tui = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tui-logger = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tokio-rustls = { workspace = true }
+
+[build-dependencies]
+built = { workspace = true }
+
+[target."cfg(not(windows))".dependencies]
+reqwest = { workspace = true }
+self_update = {
+  version = "1.3.0",
+  default-features = false,
+  features = [
+    "github",
+    "reqwest",
+    "rustls",
+  ]
+}
+
+[target."cfg(windows)".dependencies]
+reqwest = {
+  version = "0.13.5",
+  default-features = false,
+  features = [
+    "charset",
+    "http2",
+    "native-tls",
+  ]
+}
+self_update = {
+  version = "1.3.0",
+  default-features = false,
+  features = [
+    "github",
+    "native-tls",
+    "reqwest",
+  ]
+}

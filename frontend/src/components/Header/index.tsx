@@ -1,38 +1,51 @@
-import React, { useEffect, useRef, useState } from 'react'
-import { TiPin, TiPinOutline } from 'react-icons/ti'
+import type { Dispatch, SetStateAction } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { GripVertical, Minus, Pin, PinOff, Search, X } from 'lucide-react'
 
-import { DragHandleIcon, SearchIcon } from '@chakra-ui/icons'
-import {
-  Box,
-  Flex,
-  Icon,
-  IconButton,
-  Image,
-  Input,
-  InputGroup,
-  InputLeftElement,
-  Tooltip,
-} from '@chakra-ui/react'
+import { Box, Image, Input } from '@chakra-ui/react'
+import { useMutation } from '@tanstack/react-query'
 import { app } from '@tauri-apps/api'
-import { invoke } from '@tauri-apps/api/tauri'
-import { appWindow } from '@tauri-apps/api/window'
+import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 
-import logo from '../../assets/logo.webp'
-import { HeaderProps } from '../../types'
+import logo from '@/assets/logo.webp'
+import { Button } from '@/components/ui/button'
+import { Tooltip } from '@/components/ui/tooltip'
+import { useTauriEvent } from '@/hooks/useTauriEvent'
+import { invoke } from '@/lib/tauri'
 
-const Header: React.FC<HeaderProps> = ({ search, setSearch }) => {
+const appWindow = getCurrentWebviewWindow()
+
+type TrayMode = 'tray' | 'window'
+
+interface HeaderProps {
+  search: string
+  setSearch: Dispatch<SetStateAction<string>>
+}
+
+export function Header({ search, setSearch }: HeaderProps) {
   const [version, setVersion] = useState('')
   const [tooltipOpen, setTooltipOpen] = useState(false)
   const [isPinned, setIsPinned] = useState(false)
+  const [trayMode, setTrayMode] = useState<TrayMode>('tray')
   const dragHandleRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
-    app.getVersion().then(setVersion).catch(console.error)
+    app
+      .getVersion()
+      .then(setVersion)
+      .catch(() => undefined)
+    invoke<TrayMode>('get_tray_mode_cmd')
+      .then(setTrayMode)
+      .catch(() => undefined)
   }, [])
 
-  const handleSearchChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    setSearch(event.target.value)
-  }
+  useTauriEvent<boolean>('pin-state-changed', event => {
+    setIsPinned(event.payload)
+  })
+
+  useTauriEvent<TrayMode>('tray-mode-changed', event => {
+    setTrayMode(event.payload)
+  })
 
   useEffect(() => {
     if (!dragHandleRef.current) {
@@ -66,99 +79,188 @@ const Header: React.FC<HeaderProps> = ({ search, setSearch }) => {
     }
   }, [])
 
-  const handleMouseEnter = () => setTooltipOpen(true)
-  const handleMouseLeave = () => setTooltipOpen(false)
+  const exitMutation = useMutation({
+    mutationFn: () => invoke('handle_exit_app'),
+    meta: { errorToast: { title: 'Failed to exit' } },
+  })
 
-  const togglePinWindow = async () => {
-    setIsPinned(!isPinned)
-    await invoke('toggle_pin_state')
-    if (!isPinned) {
-      await appWindow.show()
-      await appWindow.setFocus()
-    }
-  }
+  const pinMutation = useMutation({
+    mutationFn: async (next: boolean) => {
+      await invoke('toggle_pin_state')
+      if (next) {
+        await appWindow.show()
+        await appWindow.setFocus()
+      }
+    },
+    onMutate: next => {
+      setIsPinned(next)
+    },
+    onError: (_error, next) => {
+      setIsPinned(!next)
+    },
+    meta: { errorToast: { title: 'Failed to toggle pin' } },
+  })
+
+  const hideMutation = useMutation({
+    mutationFn: () => invoke('hide_main_window_cmd'),
+    meta: { errorToast: { title: 'Failed to hide window' } },
+  })
 
   return (
-    <Flex
+    <Box
+      display='flex'
       alignItems='center'
       justifyContent='space-between'
-      backgroundColor='gray.800'
+      bg='bg.surface'
       borderRadius='lg'
+      borderBottomRadius='none'
       width='100%'
-      borderColor='gray.200'
-      padding='2px'
+      px={3}
+      py={3}
+      borderBottom='none'
+      border='1px solid'
+      borderColor='border'
+      position='relative'
+      zIndex={10}
     >
-      <Flex justifyContent='flex-start' alignItems='center'>
-        <Box
-          ref={dragHandleRef}
-          className='drag-handle'
-          onMouseEnter={handleMouseEnter}
-          onMouseLeave={handleMouseLeave}
-        >
-          <Tooltip
-            label='Move Window Position'
-            aria-label='position'
-            fontSize='xs'
-            lineHeight='tight'
-            closeOnMouseDown={true}
-            isOpen={tooltipOpen}
+      <Box display='flex' alignItems='center' gap={3}>
+        <Box display='flex' alignItems='center' gap={2}>
+          <Box
+            ref={dragHandleRef}
+            className='drag-handle'
+            onMouseEnter={() => setTooltipOpen(true)}
+            onMouseLeave={() => setTooltipOpen(false)}
+            cursor='move'
+            _hover={{ color: 'fg.muted' }}
+            mb={0.5}
           >
-            <Icon
-              as={DragHandleIcon}
-              height='17px'
-              width='17px'
-              color='gray.500'
-              data-drag
+            <Tooltip content='Move Window Position' open={tooltipOpen}>
+              <Box
+                as={GripVertical}
+                width='22px'
+                height='22px'
+                color='fg.subtle'
+                data-drag
+              />
+            </Tooltip>
+          </Box>
+
+          <Tooltip content={`Kftray v${version}`}>
+            <Image
+              src={logo}
+              alt='Kftray Logo'
+              width='33px'
+              height='33px'
+              objectFit='contain'
+              filter='brightness(0.9)'
+              _hover={{ filter: 'brightness(1)' }}
+              transition='filter 0.2s'
             />
           </Tooltip>
         </Box>
-        <Tooltip
-          label={`Kftray v${version}`}
-          aria-label='Kftray version'
-          fontSize='xs'
-          lineHeight='tight'
-          placement='top-end'
-        >
-          <Image src={logo} alt='Kftray Logo' boxSize='32px' ml={3} mt={0.5} />
-        </Tooltip>
-      </Flex>
-      <Flex alignItems='center' justifyContent='flex-end'>
-        <InputGroup size='xs' width='200px' mt='1'>
-          <InputLeftElement pointerEvents='none'>
-            <SearchIcon color='gray.300' />
-          </InputLeftElement>
-          <Input
-            height='25px'
-            type='text'
-            placeholder='Search'
-            value={search}
-            onChange={handleSearchChange}
-            borderRadius='md'
+
+        <Box position='relative' width='200px' ml={5}>
+          <Box
+            as={Search}
+            position='absolute'
+            zIndex={1}
+            left={2}
+            top='50%'
+            transform='translateY(-50%)'
+            width='14px'
+            height='14px'
+            color='fg.subtle'
           />
-        </InputGroup>
-        <Box mt={-7} mr={-4}>
-          <Tooltip
-            label={isPinned ? 'Unpin Window' : 'Pin Window'}
-            aria-label='Pin Window'
-            fontSize='xs'
-            lineHeight='tight'
-            placement='top'
-          >
-            <IconButton
-              aria-label='Pin Window'
-              icon={isPinned ? <TiPin /> : <TiPinOutline />}
-              onClick={togglePinWindow}
-              size='sm'
-              variant='ghost'
-              color='gray.500'
-              _hover={{ backgroundColor: 'transparent' }}
-              _active={{ backgroundColor: 'transparent' }}
-            />
-          </Tooltip>
+          <Input
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder='Search...'
+            size='sm'
+            pl={8}
+            bg='bg.raised'
+            border='1px solid'
+            borderColor='border'
+            _hover={{
+              borderColor: 'border.emphasized',
+            }}
+            _focus={{
+              borderColor: 'accent.focusRing',
+              boxShadow: 'none',
+            }}
+            height='28px'
+            fontSize='13px'
+            width='100%'
+            color='fg'
+            _placeholder={{
+              color: 'fg.faint',
+            }}
+          />
         </Box>
-      </Flex>
-    </Flex>
+      </Box>
+
+      <Box display='flex' alignItems='center' gap={1} ml={4} mr={-1}>
+        <Tooltip content={isPinned ? 'Unpin Window' : 'Pin Window'}>
+          <Button
+            aria-label={isPinned ? 'Unpin Window' : 'Pin Window'}
+            variant='ghost'
+            size='sm'
+            onClick={() => pinMutation.mutate(!isPinned)}
+            height='28px'
+            width='28px'
+            minWidth='28px'
+            p={0}
+            _hover={{ bg: 'bg.hover' }}
+            _active={{ bg: 'bg.active' }}
+          >
+            <Box
+              as={isPinned ? Pin : PinOff}
+              width='16px'
+              height='16px'
+              color='fg.muted'
+            />
+          </Button>
+        </Tooltip>
+
+        <Tooltip
+          content={trayMode === 'window' ? 'Minimize Window' : 'Hide Window'}
+        >
+          <Button
+            aria-label={
+              trayMode === 'window' ? 'Minimize Window' : 'Hide Window'
+            }
+            variant='ghost'
+            size='sm'
+            onClick={() => hideMutation.mutate()}
+            height='28px'
+            width='28px'
+            minWidth='28px'
+            p={0}
+            ml={-1.5}
+            _hover={{ bg: 'bg.hover' }}
+            _active={{ bg: 'bg.active' }}
+          >
+            <Box as={Minus} width='15px' height='15px' color='fg.muted' />
+          </Button>
+        </Tooltip>
+
+        <Tooltip content='Quit kftray'>
+          <Button
+            aria-label='Quit kftray'
+            variant='ghost'
+            size='sm'
+            onClick={() => exitMutation.mutate()}
+            height='28px'
+            width='28px'
+            minWidth='28px'
+            p={0}
+            ml={-1.5}
+            _hover={{ bg: 'bg.hover' }}
+            _active={{ bg: 'bg.active' }}
+          >
+            <Box as={X} width='15px' height='15px' color='fg.muted' />
+          </Button>
+        </Tooltip>
+      </Box>
+    </Box>
   )
 }
-
-export default Header

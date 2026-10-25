@@ -8,7 +8,7 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
-*/dist/assets/*
+*/dist/assets/**
 *.local
 
 # Editor directories and files
@@ -23,7 +23,42 @@ node_modules
 *.sw?
 */target/*
 target/*
-target*/*
-target*
-frontend/dist/*
+frontend/dist/
+crates/kftray-tauri/bin/*
+!crates/kftray-tauri/bin/.gitkeep
+bin/*
+package-lock.json
+build_rs*
+lcov.info
+lcov*
+llvm-cov*
+**/*.snap
+**/snapshots/*
+TASKS.md
+.claude/*
+.sisyphus/
+TODO.md
+PR.md
+post.md
+CLI.md
+.zed
 
+sbom-*.cdx.json
+*.cdx.json
+vuln-report.json
+grype-report.json
+vuln-report*.json
+
+fuzz/target/
+fuzz/artifacts/
+fuzz/corpus/**/crash-*
+fuzz/corpus/**/leak-*
+fuzz/corpus/**/timeout-*
+.omc/
+.debug-journal.md
+**/__pycache__/
+.omo/
+
+# core dumps
+core
+core.*

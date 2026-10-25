@@ -1,0 +1,1688 @@
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex;
+
+use log::info;
+use log::warn;
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use sqlx::{
+    Row,
+    SqlitePool,
+};
+use tokio::sync::RwLock;
+
+use crate::models::settings_model::AppSettings;
+use crate::utils::db::get_db_pool;
+use crate::utils::db_mode::{
+    DatabaseManager,
+    DatabaseMode,
+};
+use crate::utils::timeout_manager::restart_timeouts_for_running_forwards;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Setting {
+    pub key: String,
+    pub value: String,
+    pub updated_at: Option<String>,
+}
+
+pub struct SettingsManager {
+    cache: Arc<RwLock<HashMap<String, String>>>,
+}
+
+impl SettingsManager {
+    pub fn new() -> Self {
+        Self {
+            cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub async fn load_settings(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let pool = get_db_pool().await?;
+        let settings = load_all_settings(&pool).await?;
+
+        let mut cache = self.cache.write().await;
+        cache.clear();
+        for setting in settings {
+            cache.insert(setting.key, setting.value);
+        }
+        info!("Loaded {} settings from database", cache.len());
+        Ok(())
+    }
+
+    pub async fn get_setting(&self, key: &str) -> Option<String> {
+        let cache = self.cache.read().await;
+        cache.get(key).cloned()
+    }
+
+    pub async fn set_setting(
+        &self, key: &str, value: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let pool = get_db_pool().await?;
+        upsert_setting(&pool, key, value).await?;
+
+        let mut cache = self.cache.write().await;
+        cache.insert(key.to_string(), value.to_string());
+        info!("Set setting: {key} = {value}");
+        Ok(())
+    }
+
+    pub async fn get_disconnect_timeout(&self) -> Option<u32> {
+        if let Some(value) = self.get_setting("disconnect_timeout_minutes").await {
+            value.parse::<u32>().ok()
+        } else {
+            Some(0) // Default to 0 (no timeout)
+        }
+    }
+
+    pub async fn set_disconnect_timeout(
+        &self, minutes: u32,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.set_setting("disconnect_timeout_minutes", &minutes.to_string())
+            .await
+    }
+
+    pub async fn get_network_monitor(&self) -> bool {
+        if let Some(value) = self.get_setting("network_monitor").await {
+            value.parse::<bool>().unwrap_or(true)
+        } else {
+            true // Default to true
+        }
+    }
+
+    pub async fn set_network_monitor(
+        &self, enabled: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.set_setting("network_monitor", &enabled.to_string())
+            .await
+    }
+
+    pub async fn get_http_logs_default_enabled(&self) -> bool {
+        if let Some(value) = self.get_setting("http_logs_default_enabled").await {
+            value.parse::<bool>().unwrap_or(false)
+        } else {
+            false // Default to false
+        }
+    }
+
+    pub async fn set_http_logs_default_enabled(
+        &self, enabled: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.set_setting("http_logs_default_enabled", &enabled.to_string())
+            .await
+    }
+
+    pub async fn get_http_logs_max_file_size(&self) -> u64 {
+        if let Some(value) = self.get_setting("http_logs_max_file_size").await {
+            value.parse::<u64>().unwrap_or(10 * 1024 * 1024)
+        } else {
+            10 * 1024 * 1024 // Default 10MB
+        }
+    }
+
+    pub async fn set_http_logs_max_file_size(
+        &self, size: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.set_setting("http_logs_max_file_size", &size.to_string())
+            .await
+    }
+
+    pub async fn get_http_logs_retention_days(&self) -> u64 {
+        if let Some(value) = self.get_setting("http_logs_retention_days").await {
+            value.parse::<u64>().unwrap_or(7)
+        } else {
+            7 // Default 7 days
+        }
+    }
+
+    pub async fn set_http_logs_retention_days(
+        &self, days: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.set_setting("http_logs_retention_days", &days.to_string())
+            .await
+    }
+
+    pub async fn get_auto_update_enabled(&self) -> bool {
+        if let Some(value) = self.get_setting("auto_update_enabled").await {
+            value.parse::<bool>().unwrap_or(true)
+        } else {
+            true
+        }
+    }
+
+    pub async fn set_auto_update_enabled(
+        &self, enabled: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.set_setting("auto_update_enabled", &enabled.to_string())
+            .await
+    }
+
+    pub async fn get_last_update_check(&self) -> Option<i64> {
+        if let Some(value) = self.get_setting("last_update_check").await {
+            value.parse::<i64>().ok()
+        } else {
+            None
+        }
+    }
+
+    pub async fn set_last_update_check(
+        &self, timestamp: i64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.set_setting("last_update_check", &timestamp.to_string())
+            .await
+    }
+
+    pub async fn get_all_settings(&self) -> HashMap<String, String> {
+        let cache = self.cache.read().await;
+        cache.clone()
+    }
+
+    pub async fn get_app_settings(&self) -> AppSettings {
+        let settings = self.get_all_settings().await;
+        AppSettings::from_settings_manager(&settings)
+    }
+
+    pub async fn set_app_settings(
+        &self, app_settings: &AppSettings,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let settings_map = app_settings.to_settings_map();
+
+        for (key, value) in settings_map.iter() {
+            self.set_setting(key, value).await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_ssl_enabled(&self) -> bool {
+        if let Some(value) = self.get_setting("ssl_enabled").await {
+            value.parse::<bool>().unwrap_or(false)
+        } else {
+            false
+        }
+    }
+
+    pub async fn set_ssl_enabled(
+        &self, enabled: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.set_setting("ssl_enabled", &enabled.to_string()).await
+    }
+
+    pub async fn get_ssl_cert_validity_days(&self) -> u16 {
+        if let Some(value) = self.get_setting("ssl_cert_validity_days").await {
+            value.parse::<u16>().unwrap_or(365)
+        } else {
+            365
+        }
+    }
+
+    pub async fn set_ssl_cert_validity_days(
+        &self, days: u16,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.set_setting("ssl_cert_validity_days", &days.to_string())
+            .await
+    }
+
+    pub async fn get_ssl_auto_regenerate(&self) -> bool {
+        if let Some(value) = self.get_setting("ssl_auto_regenerate").await {
+            value.parse::<bool>().unwrap_or(true)
+        } else {
+            true
+        }
+    }
+
+    pub async fn set_ssl_auto_regenerate(
+        &self, enabled: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.set_setting("ssl_auto_regenerate", &enabled.to_string())
+            .await
+    }
+
+    pub async fn get_ssl_ca_auto_install(&self) -> bool {
+        if let Some(value) = self.get_setting("ssl_ca_auto_install").await {
+            value.parse::<bool>().unwrap_or(false)
+        } else {
+            false
+        }
+    }
+
+    pub async fn set_ssl_ca_auto_install(
+        &self, enabled: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.set_setting("ssl_ca_auto_install", &enabled.to_string())
+            .await
+    }
+
+    pub async fn get_global_shortcut(&self) -> String {
+        if let Some(value) = self.get_setting("global_shortcut").await {
+            value
+        } else {
+            "Ctrl+Shift+F1".to_string()
+        }
+    }
+
+    pub async fn set_global_shortcut(
+        &self, shortcut: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.set_setting("global_shortcut", shortcut).await
+    }
+
+    pub async fn get_mcp_server_enabled(&self) -> bool {
+        if let Some(value) = self.get_setting("mcp_server_enabled").await {
+            value.parse::<bool>().unwrap_or(false)
+        } else {
+            false
+        }
+    }
+
+    pub async fn set_mcp_server_enabled(
+        &self, enabled: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.set_setting("mcp_server_enabled", &enabled.to_string())
+            .await
+    }
+
+    pub async fn get_mcp_server_port(&self) -> u16 {
+        if let Some(value) = self.get_setting("mcp_server_port").await {
+            value.parse::<u16>().unwrap_or(3000)
+        } else {
+            3000
+        }
+    }
+
+    pub async fn set_mcp_server_port(
+        &self, port: u16,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.set_setting("mcp_server_port", &port.to_string()).await
+    }
+}
+
+impl Default for SettingsManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+async fn load_all_settings(pool: &SqlitePool) -> Result<Vec<Setting>, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    let rows = sqlx::query("SELECT key, value, updated_at FROM settings ORDER BY key")
+        .fetch_all(&mut *conn)
+        .await?;
+
+    let settings = rows
+        .into_iter()
+        .map(|row| Setting {
+            key: row.get("key"),
+            value: row.get("value"),
+            updated_at: row.get("updated_at"),
+        })
+        .collect();
+
+    Ok(settings)
+}
+
+pub async fn upsert_setting(pool: &SqlitePool, key: &str, value: &str) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query(
+        "INSERT INTO settings (key, value, updated_at)
+         VALUES (?, ?, CURRENT_TIMESTAMP)
+         ON CONFLICT(key) DO UPDATE SET
+         value = excluded.value,
+         updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Removes a setting from a specific database.
+pub async fn delete_setting_with_mode(
+    key: &str, mode: DatabaseMode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let context = DatabaseManager::get_context(mode).await?;
+    let mut conn = context.pool.acquire().await?;
+    sqlx::query("DELETE FROM settings WHERE key = ?")
+        .bind(key)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Reads every setting whose key starts with `prefix`, from a specific
+/// database.
+pub async fn get_settings_with_prefix_and_mode(
+    prefix: &str, mode: DatabaseMode,
+) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+    let context = DatabaseManager::get_context(mode).await?;
+    let mut conn = context.pool.acquire().await?;
+    // `LIKE` treats `_` and `%` as wildcards and ignores ASCII case, so it is
+    // used only to narrow the scan; the prefix itself is enforced below.
+    let escaped = prefix
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let rows = sqlx::query("SELECT key, value FROM settings WHERE key LIKE ? ESCAPE '\\'")
+        .bind(format!("{escaped}%"))
+        .fetch_all(&mut *conn)
+        .await?;
+
+    Ok(rows
+        .iter()
+        .map(|row| {
+            (
+                sqlx::Row::get::<String, _>(row, "key"),
+                sqlx::Row::get::<String, _>(row, "value"),
+            )
+        })
+        .filter(|(key, _)| key.starts_with(prefix))
+        .collect())
+}
+
+pub async fn get_setting(
+    key: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let pool = get_db_pool().await?;
+    get_setting_with_pool(&pool, key).await
+}
+
+pub async fn get_setting_with_pool(
+    pool: &SqlitePool, key: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = pool.acquire().await?;
+    let result = sqlx::query("SELECT value FROM settings WHERE key = ?")
+        .bind(key)
+        .fetch_optional(&mut *conn)
+        .await?;
+
+    Ok(result.map(|row| row.get("value")))
+}
+
+pub async fn set_setting(
+    key: &str, value: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let pool = get_db_pool().await?;
+    upsert_setting(&pool, key, value).await?;
+    Ok(())
+}
+
+pub async fn get_disconnect_timeout()
+-> Result<Option<u32>, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(value) = get_setting("disconnect_timeout_minutes").await? {
+        Ok(value.parse::<u32>().ok())
+    } else {
+        Ok(Some(0)) // Default to 0 (no timeout)
+    }
+}
+
+pub async fn set_disconnect_timeout(
+    minutes: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting("disconnect_timeout_minutes", &minutes.to_string()).await?;
+    restart_timeouts_for_running_forwards(DatabaseMode::File).await
+}
+
+pub async fn get_network_monitor() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(value) = get_setting("network_monitor").await? {
+        Ok(value.parse::<bool>().unwrap_or(true))
+    } else {
+        Ok(true) // Default to true
+    }
+}
+
+pub async fn set_network_monitor(
+    enabled: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting("network_monitor", &enabled.to_string()).await
+}
+
+pub async fn get_setting_with_mode(
+    key: &str, mode: DatabaseMode,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let context = DatabaseManager::get_context(mode).await?;
+    let mut conn = context.pool.acquire().await?;
+    let result = sqlx::query("SELECT value FROM settings WHERE key = ?")
+        .bind(key)
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(result.map(|row| row.get("value")))
+}
+
+pub async fn set_setting_with_mode(
+    key: &str, value: &str, mode: DatabaseMode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let context = DatabaseManager::get_context(mode).await?;
+    upsert_setting(&context.pool, key, value).await?;
+    Ok(())
+}
+
+/// Atomically increments the integer value of a setting, creating it at `1`
+/// if it does not exist yet, and returns the new value.
+///
+/// The read, increment and write happen in a single statement, so concurrent
+/// callers each observe a distinct result instead of racing a separate get
+/// and set. A value that is not numeric, or that is already at `u32::MAX`,
+/// is rejected without mutating the row: incrementing past `u32::MAX` would
+/// store a value that no longer round-trips through `u32::parse`, wedging
+/// every future increment.
+pub async fn increment_setting_with_mode(
+    key: &str, mode: DatabaseMode,
+) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+    let context = DatabaseManager::get_context(mode).await?;
+    let mut conn = context.pool.acquire().await?;
+    let row = sqlx::query(
+        "INSERT INTO settings (key, value, updated_at)
+         VALUES (?, '1', CURRENT_TIMESTAMP)
+         ON CONFLICT(key) DO UPDATE SET
+         value = CAST(value AS INTEGER) + 1,
+         updated_at = CURRENT_TIMESTAMP
+         WHERE value NOT GLOB '*[^0-9]*' AND value != '' AND CAST(value AS INTEGER) < 4294967295
+         RETURNING value",
+    )
+    .bind(key)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(row) = row else {
+        return Err(format!(
+            "setting {key} holds a non-numeric value, or is already at its maximum, and cannot \
+             be incremented"
+        )
+        .into());
+    };
+    let value: String = row.get("value");
+    Ok(value.parse()?)
+}
+
+pub async fn get_disconnect_timeout_with_mode(
+    mode: DatabaseMode,
+) -> Result<Option<u32>, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(value) = get_setting_with_mode("disconnect_timeout_minutes", mode).await? {
+        Ok(value.parse::<u32>().ok())
+    } else {
+        Ok(Some(0))
+    }
+}
+
+pub async fn set_disconnect_timeout_with_mode(
+    minutes: u32, mode: DatabaseMode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting_with_mode("disconnect_timeout_minutes", &minutes.to_string(), mode).await?;
+    restart_timeouts_for_running_forwards(mode).await
+}
+
+pub async fn get_network_monitor_with_mode(
+    mode: DatabaseMode,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(value) = get_setting_with_mode("network_monitor", mode).await? {
+        Ok(value.parse::<bool>().unwrap_or(true))
+    } else {
+        Ok(true)
+    }
+}
+
+pub async fn set_network_monitor_with_mode(
+    enabled: bool, mode: DatabaseMode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting_with_mode("network_monitor", &enabled.to_string(), mode).await
+}
+
+pub async fn get_auto_update_enabled() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(value) = get_setting("auto_update_enabled").await? {
+        Ok(value.parse::<bool>().unwrap_or(true))
+    } else {
+        Ok(true)
+    }
+}
+
+pub async fn set_auto_update_enabled(
+    enabled: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting("auto_update_enabled", &enabled.to_string()).await
+}
+
+pub async fn get_last_update_check() -> Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>>
+{
+    if let Some(value) = get_setting("last_update_check").await? {
+        Ok(value.parse::<i64>().ok())
+    } else {
+        Ok(None)
+    }
+}
+
+pub async fn set_last_update_check(
+    timestamp: i64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting("last_update_check", &timestamp.to_string()).await
+}
+
+pub async fn get_telemetry_enabled()
+-> Result<Option<bool>, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(get_setting("telemetry_enabled")
+        .await?
+        .and_then(|value| value.parse().ok()))
+}
+
+pub async fn set_telemetry_enabled(
+    enabled: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting("telemetry_enabled", &enabled.to_string()).await
+}
+
+pub async fn get_performance_enabled()
+-> Result<Option<bool>, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(get_setting("performance_enabled")
+        .await?
+        .and_then(|value| value.parse().ok()))
+}
+
+pub async fn set_performance_enabled(
+    enabled: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting("performance_enabled", &enabled.to_string()).await
+}
+
+pub async fn get_auto_update_enabled_with_mode(
+    mode: DatabaseMode,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(value) = get_setting_with_mode("auto_update_enabled", mode).await? {
+        Ok(value.parse::<bool>().unwrap_or(true))
+    } else {
+        Ok(true)
+    }
+}
+
+pub async fn set_auto_update_enabled_with_mode(
+    enabled: bool, mode: DatabaseMode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting_with_mode("auto_update_enabled", &enabled.to_string(), mode).await
+}
+
+pub async fn get_telemetry_enabled_with_mode(
+    mode: DatabaseMode,
+) -> Result<Option<bool>, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(get_setting_with_mode("telemetry_enabled", mode)
+        .await?
+        .and_then(|value| value.parse().ok()))
+}
+
+pub async fn set_telemetry_enabled_with_mode(
+    enabled: bool, mode: DatabaseMode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting_with_mode("telemetry_enabled", &enabled.to_string(), mode).await
+}
+
+pub async fn get_performance_enabled_with_mode(
+    mode: DatabaseMode,
+) -> Result<Option<bool>, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(get_setting_with_mode("performance_enabled", mode)
+        .await?
+        .and_then(|value| value.parse().ok()))
+}
+
+pub async fn set_performance_enabled_with_mode(
+    enabled: bool, mode: DatabaseMode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting_with_mode("performance_enabled", &enabled.to_string(), mode).await
+}
+
+pub async fn get_app_settings() -> Result<AppSettings, Box<dyn std::error::Error + Send + Sync>> {
+    let pool = get_db_pool().await?;
+    let settings = load_all_settings(&pool).await?;
+
+    let settings_map: HashMap<String, String> =
+        settings.into_iter().map(|s| (s.key, s.value)).collect();
+
+    Ok(AppSettings::from_settings_manager(&settings_map))
+}
+
+pub async fn set_app_settings(
+    app_settings: &AppSettings,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let pool = get_db_pool().await?;
+    let settings_map = app_settings.to_settings_map();
+
+    for (key, value) in settings_map.iter() {
+        upsert_setting(&pool, key, value).await?;
+    }
+
+    Ok(())
+}
+
+pub async fn get_ssl_enabled() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(value) = get_setting("ssl_enabled").await? {
+        Ok(value.parse::<bool>().unwrap_or(false))
+    } else {
+        Ok(false)
+    }
+}
+
+pub async fn set_ssl_enabled(
+    enabled: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting("ssl_enabled", &enabled.to_string()).await
+}
+
+pub async fn get_ssl_cert_validity_days() -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(value) = get_setting("ssl_cert_validity_days").await? {
+        Ok(value.parse::<u16>().unwrap_or(365))
+    } else {
+        Ok(365)
+    }
+}
+
+pub async fn set_ssl_cert_validity_days(
+    days: u16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting("ssl_cert_validity_days", &days.to_string()).await
+}
+
+pub async fn get_ssl_auto_regenerate() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(value) = get_setting("ssl_auto_regenerate").await? {
+        Ok(value.parse::<bool>().unwrap_or(true))
+    } else {
+        Ok(true)
+    }
+}
+
+pub async fn set_ssl_auto_regenerate(
+    enabled: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting("ssl_auto_regenerate", &enabled.to_string()).await
+}
+
+pub async fn get_ssl_ca_auto_install() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(value) = get_setting("ssl_ca_auto_install").await? {
+        Ok(value.parse::<bool>().unwrap_or(false))
+    } else {
+        Ok(false)
+    }
+}
+
+pub async fn set_ssl_ca_auto_install(
+    enabled: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting("ssl_ca_auto_install", &enabled.to_string()).await
+}
+
+pub async fn get_global_shortcut() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(value) = get_setting("global_shortcut").await? {
+        Ok(value)
+    } else {
+        Ok("Ctrl+Shift+F1".to_string())
+    }
+}
+
+pub async fn set_global_shortcut(
+    shortcut: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting("global_shortcut", shortcut).await
+}
+
+pub async fn get_mcp_server_enabled() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(value) = get_setting("mcp_server_enabled").await? {
+        Ok(value.parse::<bool>().unwrap_or(false))
+    } else {
+        Ok(false)
+    }
+}
+
+pub async fn set_mcp_server_enabled(
+    enabled: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting("mcp_server_enabled", &enabled.to_string()).await
+}
+
+pub async fn get_mcp_server_port() -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(value) = get_setting("mcp_server_port").await? {
+        Ok(value.parse::<u16>().unwrap_or(3000))
+    } else {
+        Ok(3000)
+    }
+}
+
+pub async fn set_mcp_server_port(
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting("mcp_server_port", &port.to_string()).await
+}
+
+pub async fn get_ssl_enabled_with_mode(
+    mode: DatabaseMode,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(value) = get_setting_with_mode("ssl_enabled", mode).await? {
+        Ok(value.parse::<bool>().unwrap_or(false))
+    } else {
+        Ok(false)
+    }
+}
+
+pub async fn set_ssl_enabled_with_mode(
+    enabled: bool, mode: DatabaseMode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting_with_mode("ssl_enabled", &enabled.to_string(), mode).await
+}
+
+pub async fn get_ssl_cert_validity_days_with_mode(
+    mode: DatabaseMode,
+) -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(value) = get_setting_with_mode("ssl_cert_validity_days", mode).await? {
+        Ok(value.parse::<u16>().unwrap_or(365))
+    } else {
+        Ok(365)
+    }
+}
+
+pub async fn set_ssl_cert_validity_days_with_mode(
+    days: u16, mode: DatabaseMode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting_with_mode("ssl_cert_validity_days", &days.to_string(), mode).await
+}
+
+pub async fn get_ssl_auto_regenerate_with_mode(
+    mode: DatabaseMode,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(value) = get_setting_with_mode("ssl_auto_regenerate", mode).await? {
+        Ok(value.parse::<bool>().unwrap_or(true))
+    } else {
+        Ok(true)
+    }
+}
+
+pub async fn set_ssl_auto_regenerate_with_mode(
+    enabled: bool, mode: DatabaseMode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting_with_mode("ssl_auto_regenerate", &enabled.to_string(), mode).await
+}
+
+pub async fn get_ssl_ca_auto_install_with_mode(
+    mode: DatabaseMode,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(value) = get_setting_with_mode("ssl_ca_auto_install", mode).await? {
+        Ok(value.parse::<bool>().unwrap_or(false))
+    } else {
+        Ok(false)
+    }
+}
+
+pub async fn set_ssl_ca_auto_install_with_mode(
+    enabled: bool, mode: DatabaseMode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_setting_with_mode("ssl_ca_auto_install", &enabled.to_string(), mode).await
+}
+
+pub async fn get_app_settings_with_mode(
+    mode: DatabaseMode,
+) -> Result<AppSettings, Box<dyn std::error::Error + Send + Sync>> {
+    let context = DatabaseManager::get_context(mode).await?;
+    let settings = load_all_settings(&context.pool).await?;
+
+    let settings_map: HashMap<String, String> =
+        settings.into_iter().map(|s| (s.key, s.value)).collect();
+
+    Ok(AppSettings::from_settings_manager(&settings_map))
+}
+
+/// Scope prefix of a database mode inside a setting key.
+pub fn mode_scope(mode: DatabaseMode) -> &'static str {
+    match mode {
+        DatabaseMode::File => "file",
+        DatabaseMode::Memory => "memory",
+    }
+}
+
+/// Key under which an exposure is marked as one whose ingress history was
+/// never recorded, because it predates the recording.
+pub fn expose_legacy_key(config_id: &str, mode: DatabaseMode) -> String {
+    format!("expose_legacy_possible:{}:{config_id}", mode_scope(mode))
+}
+
+/// Key under which a database records that its baseline has been taken.
+pub fn expose_history_baseline_key(mode: DatabaseMode) -> String {
+    format!("expose_history_baseline:{}", mode_scope(mode))
+}
+
+/// Key under which the ids snapshotted by a failed init baseline attempt are
+/// persisted, so a lazy baseline establishment in a later process restarted
+/// on this database still restricts itself to configs that existed before
+/// the failed attempt, instead of the in-memory snapshot being lost with the
+/// process and every currently existing row being treated as unrestricted.
+fn expose_baseline_pending_ids_key(mode: DatabaseMode) -> String {
+    format!("expose_baseline_pending_ids:{}", mode_scope(mode))
+}
+
+/// Config ids seen at the moment this process gave up retrying the
+/// baseline, keyed by database mode.
+///
+/// A later lazy call (from `ensure_expose_history_baseline`) uses this to
+/// mark only ids that already existed back then as having no recoverable
+/// history: without it, a row inserted after the failed init would be swept
+/// up by whatever the lazy call happens to see in the `configs` table and
+/// wrongly marked as predating ingress history.
+static FAILED_BASELINE_SNAPSHOT: LazyLock<Mutex<HashMap<DatabaseMode, HashSet<i64>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const BASELINE_INIT_ATTEMPTS: u32 = 3;
+const BASELINE_INIT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Establishes the expose history baseline at database initialisation,
+/// retrying a transient failure (e.g. `SQLITE_BUSY` from another kftray
+/// process sharing the file database) a few times before giving up.
+///
+/// If every attempt fails, the ids of the configs that exist right now are
+/// snapshotted so a later lazy call marks only those ids as legacy, never
+/// one inserted afterwards.
+pub async fn establish_expose_history_baseline_at_init(
+    pool: &SqlitePool, mode: DatabaseMode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut last_error = None;
+    for attempt in 0..BASELINE_INIT_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(BASELINE_INIT_RETRY_DELAY * attempt).await;
+        }
+        match establish_expose_history_baseline(pool, mode).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    if let Ok(rows) = sqlx::query("SELECT id FROM configs").fetch_all(pool).await {
+        let ids: HashSet<i64> = rows
+            .iter()
+            .filter_map(|row| row.try_get("id").ok())
+            .collect();
+        let serialized =
+            serde_json::to_string(&ids.iter().copied().collect::<Vec<_>>()).unwrap_or_default();
+        FAILED_BASELINE_SNAPSHOT.lock().unwrap().insert(mode, ids);
+        if let Err(error) =
+            upsert_setting(pool, &expose_baseline_pending_ids_key(mode), &serialized).await
+        {
+            warn!(
+                "failed to persist the expose baseline pending id allow-list: {error}; \
+                 relying on the in-memory snapshot for this process only"
+            );
+        }
+    }
+    // If the snapshot query itself fails, no entry is recorded for `mode`:
+    // the lazy path then treats every row it later sees as unrestricted,
+    // instead of an empty allow-list that would mark nothing.
+
+    Err(last_error.expect("loop runs at least once"))
+}
+
+pub async fn establish_expose_history_baseline(
+    pool: &SqlitePool, mode: DatabaseMode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let baseline = expose_history_baseline_key(mode);
+    // The common case, on every expose start and stop once a baseline has
+    // been taken, is that the marker is already present: check it with a
+    // plain read against the pool first, so that case never pays for the
+    // exclusive write lock below.
+    if sqlx::query("SELECT 1 FROM settings WHERE key = ?")
+        .bind(&baseline)
+        .fetch_optional(pool)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    // One write transaction from the check to the marker: two processes
+    // sharing the file database can both initialise it, and a baseline taken
+    // by the second after the first finished would mark rows inserted in
+    // between, which do have a history, as ones that never had one. An
+    // immediate transaction takes the write lock up front, so the second
+    // initialiser sees the marker the first wrote.
+    // Through the transaction guard: a future dropped partway, or a failed
+    // commit, must not hand the pooled connection back with a write
+    // transaction still open on it.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let in_memory_snapshot = FAILED_BASELINE_SNAPSHOT.lock().unwrap().get(&mode).cloned();
+    let allowed_ids = match in_memory_snapshot {
+        Some(ids) => Some(ids),
+        // The in-memory snapshot only survives within the process that took
+        // it; a process restarted after a failed init still needs the
+        // allow-list it persisted, or it would treat every row it now sees
+        // as unrestricted and mark rows created after the failed attempt.
+        None => read_pending_baseline_ids(&mut tx, mode).await?,
+    };
+    take_expose_history_baseline(&mut tx, &baseline, mode, allowed_ids.as_ref()).await?;
+    clear_pending_baseline_ids(&mut tx, mode).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn read_pending_baseline_ids(
+    conn: &mut sqlx::SqliteConnection, mode: DatabaseMode,
+) -> Result<Option<HashSet<i64>>, Box<dyn std::error::Error + Send + Sync>> {
+    let row = sqlx::query("SELECT value FROM settings WHERE key = ?")
+        .bind(expose_baseline_pending_ids_key(mode))
+        .fetch_optional(&mut *conn)
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let value: String = row.try_get("value")?;
+    let ids: Vec<i64> = serde_json::from_str(&value)?;
+    Ok(Some(ids.into_iter().collect()))
+}
+
+/// Deletes the persisted allow-list once the baseline marker has been
+/// written (or was already present), so it never lingers to restrict a
+/// baseline this database will never take again.
+async fn clear_pending_baseline_ids(
+    conn: &mut sqlx::SqliteConnection, mode: DatabaseMode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    sqlx::query("DELETE FROM settings WHERE key = ?")
+        .bind(expose_baseline_pending_ids_key(mode))
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+async fn take_expose_history_baseline(
+    conn: &mut sqlx::SqliteConnection, baseline: &str, mode: DatabaseMode,
+    allowed_ids: Option<&HashSet<i64>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    const UPSERT: &str = "INSERT INTO settings (key, value, updated_at) VALUES (?, '1', \
+                          CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = \
+                          excluded.value, updated_at = CURRENT_TIMESTAMP";
+
+    let taken = sqlx::query("SELECT value FROM settings WHERE key = ?")
+        .bind(baseline)
+        .fetch_optional(&mut *conn)
+        .await?;
+    if taken.is_some() {
+        return Ok(());
+    }
+    let rows = sqlx::query("SELECT id, data FROM configs")
+        .fetch_all(&mut *conn)
+        .await?;
+    for row in rows {
+        let id: i64 = row.try_get("id")?;
+        if allowed_ids.is_some_and(|allowed| !allowed.contains(&id)) {
+            continue;
+        }
+        let data: String = row.try_get("data")?;
+        // Only the one field matters, read on its own: a row whose other
+        // fields do not decode is still an exposure if this one says so, and
+        // the baseline is taken once, so a row misread now would be treated
+        // ever after as one that has a history it never had. A row that is
+        // not even JSON is marked too, on the same reasoning.
+        let is_exposure = match serde_json::from_str::<serde_json::Value>(&data) {
+            Ok(value) => {
+                value.get("workload_type").and_then(|kind| kind.as_str()) == Some("expose")
+            }
+            Err(_) => true,
+        };
+        if !is_exposure {
+            continue;
+        }
+        sqlx::query(UPSERT)
+            .bind(expose_legacy_key(&id.to_string(), mode))
+            .execute(&mut *conn)
+            .await?;
+    }
+    sqlx::query(UPSERT)
+        .bind(baseline)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::SqlitePool;
+
+    use super::*;
+    use crate::utils::db::create_db_table;
+
+    async fn create_test_pool() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        create_db_table(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn test_upsert_setting() {
+        let pool = create_test_pool().await;
+
+        upsert_setting(&pool, "test_key", "test_value")
+            .await
+            .unwrap();
+
+        let result: String = sqlx::query("SELECT value FROM settings WHERE key = 'test_key'")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("value");
+        assert_eq!(result, "test_value");
+
+        upsert_setting(&pool, "test_key", "updated_value")
+            .await
+            .unwrap();
+
+        let result: String = sqlx::query("SELECT value FROM settings WHERE key = 'test_key'")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("value");
+        assert_eq!(result, "updated_value");
+    }
+
+    #[tokio::test]
+    async fn test_load_all_settings() {
+        let pool = create_test_pool().await;
+
+        upsert_setting(&pool, "key1", "value1").await.unwrap();
+        upsert_setting(&pool, "key2", "value2").await.unwrap();
+
+        let settings = load_all_settings(&pool).await.unwrap();
+
+        assert_eq!(settings.len(), 2);
+        assert_eq!(settings[0].key, "key1");
+        assert_eq!(settings[0].value, "value1");
+        assert_eq!(settings[1].key, "key2");
+        assert_eq!(settings[1].value, "value2");
+    }
+
+    #[tokio::test]
+    async fn test_settings_manager() {
+        let pool = create_test_pool().await;
+
+        upsert_setting(&pool, "test_timeout", "30").await.unwrap();
+        let settings = load_all_settings(&pool).await.unwrap();
+        assert_eq!(settings.len(), 1);
+        assert_eq!(settings[0].key, "test_timeout");
+        assert_eq!(settings[0].value, "30");
+
+        upsert_setting(&pool, "test_timeout", "60").await.unwrap();
+        let settings = load_all_settings(&pool).await.unwrap();
+        assert_eq!(settings.len(), 1);
+        assert_eq!(settings[0].value, "60");
+
+        let _manager = SettingsManager::new();
+    }
+
+    #[tokio::test]
+    async fn test_settings_with_mode_memory() {
+        let _db = crate::test_utils::test_db().await;
+        set_setting_with_mode("memory_test", "test_value", DatabaseMode::Memory)
+            .await
+            .unwrap();
+
+        let value = get_setting_with_mode("memory_test", DatabaseMode::Memory)
+            .await
+            .unwrap();
+        assert_eq!(value, Some("test_value".to_string()));
+
+        set_disconnect_timeout_with_mode(120, DatabaseMode::Memory)
+            .await
+            .unwrap();
+        let timeout = get_disconnect_timeout_with_mode(DatabaseMode::Memory)
+            .await
+            .unwrap();
+        assert_eq!(timeout, Some(120));
+
+        set_network_monitor_with_mode(false, DatabaseMode::Memory)
+            .await
+            .unwrap();
+        let monitor = get_network_monitor_with_mode(DatabaseMode::Memory)
+            .await
+            .unwrap();
+        assert!(!monitor);
+    }
+
+    #[tokio::test]
+    async fn test_settings_isolation_between_modes() {
+        let _db = crate::test_utils::test_db().await;
+        let memory_context = DatabaseManager::get_context(DatabaseMode::Memory)
+            .await
+            .unwrap();
+        let memory_key = "isolation_test_memory";
+
+        upsert_setting(&memory_context.pool, memory_key, "memory_value")
+            .await
+            .unwrap();
+
+        let memory_result = get_setting_with_pool(&memory_context.pool, memory_key)
+            .await
+            .unwrap();
+        assert_eq!(memory_result, Some("memory_value".to_string()));
+
+        let different_key = "isolation_test_different";
+        let different_result = get_setting_with_pool(&memory_context.pool, different_key)
+            .await
+            .unwrap();
+        assert!(
+            different_result.is_none(),
+            "Different key should not have data"
+        );
+
+        let same_result = get_setting_with_pool(&memory_context.pool, memory_key)
+            .await
+            .unwrap();
+        assert_eq!(same_result, Some("memory_value".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_lazy_baseline_never_marks_row_created_after_failed_init_memory_mode() {
+        let _db = crate::test_utils::test_db().await;
+
+        let context = DatabaseManager::get_context(DatabaseMode::Memory)
+            .await
+            .unwrap();
+        let pool = context.pool.clone();
+
+        crate::utils::config::delete_all_configs_with_pool(&pool)
+            .await
+            .unwrap();
+        let _ = delete_setting_with_mode(
+            &expose_history_baseline_key(DatabaseMode::Memory),
+            DatabaseMode::Memory,
+        )
+        .await;
+
+        let existing_config = crate::models::config_model::Config {
+            workload_type: Some("expose".to_string()),
+            ..Default::default()
+        };
+        let existing_id = crate::utils::config::insert_config_with_pool_and_mode(
+            existing_config,
+            &pool,
+            DatabaseMode::Memory,
+        )
+        .await
+        .unwrap();
+
+        // Simulate a process that failed every baseline retry at init: at
+        // that moment only `existing_id` existed.
+        FAILED_BASELINE_SNAPSHOT
+            .lock()
+            .unwrap()
+            .insert(DatabaseMode::Memory, HashSet::from([existing_id]));
+
+        let created_after_failed_init = crate::models::config_model::Config {
+            workload_type: Some("expose".to_string()),
+            ..Default::default()
+        };
+        let after_id = crate::utils::config::insert_config_with_pool_and_mode(
+            created_after_failed_init,
+            &pool,
+            DatabaseMode::Memory,
+        )
+        .await
+        .unwrap();
+
+        establish_expose_history_baseline(&pool, DatabaseMode::Memory)
+            .await
+            .unwrap();
+
+        let existing_marked = get_setting_with_mode(
+            &expose_legacy_key(&existing_id.to_string(), DatabaseMode::Memory),
+            DatabaseMode::Memory,
+        )
+        .await
+        .unwrap();
+        assert!(
+            existing_marked.is_some(),
+            "a config that existed at the failed-init snapshot must be marked legacy"
+        );
+
+        let after_marked = get_setting_with_mode(
+            &expose_legacy_key(&after_id.to_string(), DatabaseMode::Memory),
+            DatabaseMode::Memory,
+        )
+        .await
+        .unwrap();
+        assert!(
+            after_marked.is_none(),
+            "a config created after the failed init must never be marked legacy"
+        );
+
+        FAILED_BASELINE_SNAPSHOT
+            .lock()
+            .unwrap()
+            .remove(&DatabaseMode::Memory);
+        let _ = delete_setting_with_mode(
+            &expose_history_baseline_key(DatabaseMode::Memory),
+            DatabaseMode::Memory,
+        )
+        .await;
+        let _ = crate::utils::config::delete_all_configs_with_pool(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn test_failed_snapshot_query_leaves_lazy_baseline_unrestricted_memory_mode() {
+        let _db = crate::test_utils::test_db().await;
+
+        let context = DatabaseManager::get_context(DatabaseMode::Memory)
+            .await
+            .unwrap();
+        let pool = context.pool.clone();
+
+        crate::utils::config::delete_all_configs_with_pool(&pool)
+            .await
+            .unwrap();
+        let _ = delete_setting_with_mode(
+            &expose_history_baseline_key(DatabaseMode::Memory),
+            DatabaseMode::Memory,
+        )
+        .await;
+        FAILED_BASELINE_SNAPSHOT
+            .lock()
+            .unwrap()
+            .remove(&DatabaseMode::Memory);
+
+        // Force every baseline attempt, including the fallback snapshot
+        // query, to fail.
+        sqlx::query("DROP TABLE configs")
+            .execute(&*pool)
+            .await
+            .unwrap();
+
+        let init_result =
+            establish_expose_history_baseline_at_init(&pool, DatabaseMode::Memory).await;
+        assert!(
+            init_result.is_err(),
+            "every attempt must fail with no configs table"
+        );
+        assert!(
+            FAILED_BASELINE_SNAPSHOT
+                .lock()
+                .unwrap()
+                .get(&DatabaseMode::Memory)
+                .is_none(),
+            "a failed snapshot query must not record an empty allow-list"
+        );
+
+        // Recreate the schema, as `db::init` would on the next run, and
+        // insert a pre-existing exposure the failed init never saw.
+        crate::utils::db::create_db_table(&pool).await.unwrap();
+
+        let pre_existing = crate::models::config_model::Config {
+            workload_type: Some("expose".to_string()),
+            ..Default::default()
+        };
+        let pre_existing_id = crate::utils::config::insert_config_with_pool_and_mode(
+            pre_existing,
+            &pool,
+            DatabaseMode::Memory,
+        )
+        .await
+        .unwrap();
+
+        establish_expose_history_baseline(&pool, DatabaseMode::Memory)
+            .await
+            .unwrap();
+
+        let marked = get_setting_with_mode(
+            &expose_legacy_key(&pre_existing_id.to_string(), DatabaseMode::Memory),
+            DatabaseMode::Memory,
+        )
+        .await
+        .unwrap();
+        assert!(
+            marked.is_some(),
+            "the lazy baseline must mark a pre-existing exposure when init's snapshot failed"
+        );
+
+        FAILED_BASELINE_SNAPSHOT
+            .lock()
+            .unwrap()
+            .remove(&DatabaseMode::Memory);
+        let _ = delete_setting_with_mode(
+            &expose_history_baseline_key(DatabaseMode::Memory),
+            DatabaseMode::Memory,
+        )
+        .await;
+        let _ = crate::utils::config::delete_all_configs_with_pool(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_is_recorded_in_memory_even_when_persisting_it_fails_memory_mode() {
+        let _db = crate::test_utils::test_db().await;
+
+        let context = DatabaseManager::get_context(DatabaseMode::Memory)
+            .await
+            .unwrap();
+        let pool = context.pool.clone();
+
+        crate::utils::config::delete_all_configs_with_pool(&pool)
+            .await
+            .unwrap();
+        let _ = delete_setting_with_mode(
+            &expose_history_baseline_key(DatabaseMode::Memory),
+            DatabaseMode::Memory,
+        )
+        .await;
+        FAILED_BASELINE_SNAPSHOT
+            .lock()
+            .unwrap()
+            .remove(&DatabaseMode::Memory);
+
+        let existing_config = crate::models::config_model::Config {
+            workload_type: Some("expose".to_string()),
+            ..Default::default()
+        };
+        let existing_id = crate::utils::config::insert_config_with_pool_and_mode(
+            existing_config,
+            &pool,
+            DatabaseMode::Memory,
+        )
+        .await
+        .unwrap();
+
+        // `configs` is left intact so the fallback snapshot query still
+        // succeeds; only `settings` is gone, so both
+        // `establish_expose_history_baseline` and the allow-list persist
+        // attempt fail.
+        sqlx::query("DROP TABLE settings")
+            .execute(&*pool)
+            .await
+            .unwrap();
+
+        let init_result =
+            establish_expose_history_baseline_at_init(&pool, DatabaseMode::Memory).await;
+        assert!(
+            init_result.is_err(),
+            "every attempt must fail with no settings table"
+        );
+        assert_eq!(
+            FAILED_BASELINE_SNAPSHOT
+                .lock()
+                .unwrap()
+                .get(&DatabaseMode::Memory)
+                .cloned(),
+            Some(HashSet::from([existing_id])),
+            "the in-memory snapshot must be recorded even though persisting the allow-list \
+             failed"
+        );
+
+        // Recreate the schema, as `db::init` would on the next run.
+        crate::utils::db::create_db_table(&pool).await.unwrap();
+
+        FAILED_BASELINE_SNAPSHOT
+            .lock()
+            .unwrap()
+            .remove(&DatabaseMode::Memory);
+        let _ = crate::utils::config::delete_all_configs_with_pool(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn test_persisted_baseline_allow_list_survives_a_restart_memory_mode() {
+        let _db = crate::test_utils::test_db().await;
+
+        let context = DatabaseManager::get_context(DatabaseMode::Memory)
+            .await
+            .unwrap();
+        let pool = context.pool.clone();
+
+        crate::utils::config::delete_all_configs_with_pool(&pool)
+            .await
+            .unwrap();
+        let _ = delete_setting_with_mode(
+            &expose_history_baseline_key(DatabaseMode::Memory),
+            DatabaseMode::Memory,
+        )
+        .await;
+        let _ = delete_setting_with_mode(
+            &expose_baseline_pending_ids_key(DatabaseMode::Memory),
+            DatabaseMode::Memory,
+        )
+        .await;
+        FAILED_BASELINE_SNAPSHOT
+            .lock()
+            .unwrap()
+            .remove(&DatabaseMode::Memory);
+
+        let existing_config = crate::models::config_model::Config {
+            workload_type: Some("expose".to_string()),
+            ..Default::default()
+        };
+        let existing_id = crate::utils::config::insert_config_with_pool_and_mode(
+            existing_config,
+            &pool,
+            DatabaseMode::Memory,
+        )
+        .await
+        .unwrap();
+
+        // A process that failed every baseline retry at init persists the
+        // ids it saw to settings, on top of the in-memory snapshot.
+        upsert_setting(
+            &pool,
+            &expose_baseline_pending_ids_key(DatabaseMode::Memory),
+            &serde_json::to_string(&[existing_id]).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Simulate a restart: a new process starts with an empty static, so
+        // only the persisted settings key carries the allow-list forward.
+        FAILED_BASELINE_SNAPSHOT
+            .lock()
+            .unwrap()
+            .remove(&DatabaseMode::Memory);
+
+        let created_after_failed_init = crate::models::config_model::Config {
+            workload_type: Some("expose".to_string()),
+            ..Default::default()
+        };
+        let after_id = crate::utils::config::insert_config_with_pool_and_mode(
+            created_after_failed_init,
+            &pool,
+            DatabaseMode::Memory,
+        )
+        .await
+        .unwrap();
+
+        establish_expose_history_baseline(&pool, DatabaseMode::Memory)
+            .await
+            .unwrap();
+
+        let existing_marked = get_setting_with_mode(
+            &expose_legacy_key(&existing_id.to_string(), DatabaseMode::Memory),
+            DatabaseMode::Memory,
+        )
+        .await
+        .unwrap();
+        assert!(
+            existing_marked.is_some(),
+            "a config recorded in the persisted allow-list must be marked legacy after a restart"
+        );
+
+        let after_marked = get_setting_with_mode(
+            &expose_legacy_key(&after_id.to_string(), DatabaseMode::Memory),
+            DatabaseMode::Memory,
+        )
+        .await
+        .unwrap();
+        assert!(
+            after_marked.is_none(),
+            "a config created after the failed init must never be marked legacy, even after a \
+             restart lost the in-memory snapshot"
+        );
+
+        let pending_after = get_setting_with_mode(
+            &expose_baseline_pending_ids_key(DatabaseMode::Memory),
+            DatabaseMode::Memory,
+        )
+        .await
+        .unwrap();
+        assert!(
+            pending_after.is_none(),
+            "the persisted allow-list must be deleted once the baseline marker is written"
+        );
+
+        FAILED_BASELINE_SNAPSHOT
+            .lock()
+            .unwrap()
+            .remove(&DatabaseMode::Memory);
+        let _ = delete_setting_with_mode(
+            &expose_history_baseline_key(DatabaseMode::Memory),
+            DatabaseMode::Memory,
+        )
+        .await;
+        let _ = crate::utils::config::delete_all_configs_with_pool(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn test_malformed_persisted_allow_list_errors_and_leaves_the_pending_key_memory_mode() {
+        let _db = crate::test_utils::test_db().await;
+
+        let context = DatabaseManager::get_context(DatabaseMode::Memory)
+            .await
+            .unwrap();
+        let pool = context.pool.clone();
+
+        let _ = delete_setting_with_mode(
+            &expose_history_baseline_key(DatabaseMode::Memory),
+            DatabaseMode::Memory,
+        )
+        .await;
+        let _ = delete_setting_with_mode(
+            &expose_baseline_pending_ids_key(DatabaseMode::Memory),
+            DatabaseMode::Memory,
+        )
+        .await;
+        FAILED_BASELINE_SNAPSHOT
+            .lock()
+            .unwrap()
+            .remove(&DatabaseMode::Memory);
+
+        // Not valid JSON: what a corrupted or hand-edited settings row
+        // leaves behind.
+        upsert_setting(
+            &pool,
+            &expose_baseline_pending_ids_key(DatabaseMode::Memory),
+            "not json",
+        )
+        .await
+        .unwrap();
+
+        let result = establish_expose_history_baseline(&pool, DatabaseMode::Memory).await;
+        assert!(
+            result.is_err(),
+            "a malformed persisted allow-list must error instead of silently becoming an empty \
+             list"
+        );
+
+        let pending = get_setting_with_mode(
+            &expose_baseline_pending_ids_key(DatabaseMode::Memory),
+            DatabaseMode::Memory,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pending,
+            Some("not json".to_string()),
+            "a rejected malformed allow-list must be left in place, not cleared"
+        );
+
+        let baseline_taken = get_setting_with_mode(
+            &expose_history_baseline_key(DatabaseMode::Memory),
+            DatabaseMode::Memory,
+        )
+        .await
+        .unwrap();
+        assert!(
+            baseline_taken.is_none(),
+            "the baseline marker must not be written when the allow-list read failed"
+        );
+
+        let _ = delete_setting_with_mode(
+            &expose_baseline_pending_ids_key(DatabaseMode::Memory),
+            DatabaseMode::Memory,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_increment_setting_with_mode_errors_on_a_non_numeric_value_memory_mode() {
+        let _db = crate::test_utils::test_db().await;
+
+        for junk in ["not-a-number", "12abc"] {
+            let key = format!("junk_counter_test:{junk}:memory");
+            let _ = delete_setting_with_mode(&key, DatabaseMode::Memory).await;
+
+            let context = DatabaseManager::get_context(DatabaseMode::Memory)
+                .await
+                .unwrap();
+            upsert_setting(&context.pool, &key, junk).await.unwrap();
+
+            let result = increment_setting_with_mode(&key, DatabaseMode::Memory).await;
+            assert!(
+                result.is_err(),
+                "a junk counter value ({junk}) must error instead of silently incrementing from a CAST-to-0"
+            );
+
+            let value = get_setting_with_mode(&key, DatabaseMode::Memory)
+                .await
+                .unwrap();
+            assert_eq!(
+                value,
+                Some(junk.to_string()),
+                "a rejected increment must leave the junk value ({junk}) untouched"
+            );
+
+            let _ = delete_setting_with_mode(&key, DatabaseMode::Memory).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_increment_setting_with_mode_increments_a_numeric_value_memory_mode() {
+        let _db = crate::test_utils::test_db().await;
+
+        let key = "numeric_counter_test:memory";
+        let _ = delete_setting_with_mode(key, DatabaseMode::Memory).await;
+
+        let first = increment_setting_with_mode(key, DatabaseMode::Memory)
+            .await
+            .unwrap();
+        assert_eq!(first, 1);
+
+        let second = increment_setting_with_mode(key, DatabaseMode::Memory)
+            .await
+            .unwrap();
+        assert_eq!(second, 2);
+
+        let _ = delete_setting_with_mode(key, DatabaseMode::Memory).await;
+    }
+
+    #[tokio::test]
+    async fn test_increment_setting_with_mode_rejects_an_already_maxed_counter_memory_mode() {
+        let _db = crate::test_utils::test_db().await;
+
+        let key = "maxed_counter_test:memory";
+        let _ = delete_setting_with_mode(key, DatabaseMode::Memory).await;
+
+        let context = DatabaseManager::get_context(DatabaseMode::Memory)
+            .await
+            .unwrap();
+        upsert_setting(&context.pool, key, &u32::MAX.to_string())
+            .await
+            .unwrap();
+
+        let result = increment_setting_with_mode(key, DatabaseMode::Memory).await;
+        assert!(
+            result.is_err(),
+            "a counter already at u32::MAX must be rejected instead of overflowing on increment"
+        );
+
+        let value = get_setting_with_mode(key, DatabaseMode::Memory)
+            .await
+            .unwrap();
+        assert_eq!(
+            value,
+            Some(u32::MAX.to_string()),
+            "a rejected increment must leave the maxed counter untouched"
+        );
+
+        let _ = delete_setting_with_mode(key, DatabaseMode::Memory).await;
+    }
+}

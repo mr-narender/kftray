@@ -1,24 +1,34 @@
 {
-	"name": "kftray",
-	"version": "0.11.7",
-	"private": true,
-	"scripts": {
-		"build": "pnpm --filter @kftray/ui run build",
-		"check": "pnpm --filter @kftray/uirun check",
-		"dev": "pnpm --filter @kftray/ui run dev",
-		"format": "pnpm run format:front && pnpm run format:back",
-		"format:back": "cargo fmt",
-		"format:front": "pnpm --filter @kftray/ui run format",
-		"generate-icons": "cargo run --bin generate_icons",
-		"lint": "pnpm --filter @kftray/ui run lint && pnpm run lint:back",
-		"lint:back": "cargo clippy --workspace --all-targets --all-features",
-		"lint:front": "pnpm --filter @kftray/ui run lint",
-		"precommit": "pnpm run format && pnpm run lint",
-		"release:minor": "cargo run --bin bump_version minor && git add . && git commit -m 'chore: release new version'",
-		"release:patch": "cargo run --bin bump_version patch && git add . && git commit -m 'chore: release new version'",
-		"tauri": "tauri"
-	},
-	"devDependencies": {
-		"@tauri-apps/cli": "^1.5.14"
-	}
+  "name": "kftray",
+  "version": "0.33.0",
+  "private": true,
+  "packageManager": "pnpm@12.15.0",
+  "scripts": {
+    "build": "pnpm --filter @kftray/ui run build",
+    "build:analyze": "pnpm --filter @kftray/ui run build:analyze",
+    "bump:patch": "cd hacks/kftray-utils && cargo run --bin bump_version patch",
+    "bump:minor": "cd hacks/kftray-utils && cargo run --bin bump_version minor",
+    "bump:major": "cd hacks/kftray-utils && cargo run --bin bump_version major",
+    "check": "pnpm --filter @kftray/ui run check",
+    "dev": "pnpm --filter @kftray/ui run dev",
+    "format": "pnpm run format:front && pnpm run format:back",
+    "format:back": "rustup run nightly cargo fmt",
+    "format:front": "pnpm --filter @kftray/ui run format",
+    "generate-icons": "cargo run --manifest-path hacks/kftray-utils/Cargo.toml --bin generate_icons",
+    "lint": "pnpm --filter @kftray/ui run lint && pnpm run lint:back",
+    "lint:back": "cargo build --bin kftray-helper --release && cargo clippy --workspace --all-targets --all-features -- -D warnings",
+    "lint:front": "pnpm --filter @kftray/ui run lint",
+    "test:server": "bash hacks/server/test_proxy.sh",
+    "test:back": "cargo build --bin kftray-helper --release && INSTA_UPDATE=1 RUST_BACKTRACE=1 cargo llvm-cov nextest --profile ci --config-file .cargo/nextest.toml --locked --workspace --all-features --lib --bins --examples --tests",
+    "precommit": "pnpm run format && pnpm run lint && pnpm run test:back",
+    "release:minor": "cargo run --bin bump_version minor && git add . && git commit -m 'chore: release new version'",
+    "release:patch": "cargo run --bin bump_version patch && git add . && git commit -m 'chore: release new version'",
+    "tauri": "cargo build --bin kftray-helper --release && tauri",
+    "knip": "knip"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.2",
+    "@tauri-apps/cli": "^2.12.1",
+    "knip": "6.42.1"
+  }
 }

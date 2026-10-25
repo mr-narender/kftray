@@ -1,0 +1,116 @@
+//! KFtray MCP Server - Model Context Protocol server for LLM integration.
+//!
+//! This server exposes kftray functionality via the MCP protocol, allowing
+//! LLMs to manage Kubernetes port-forwarding sessions.
+//!
+//! # Usage
+//!
+//! ```bash
+//! # Start server on default port 3000
+//! kftray-mcp
+//!
+//! # Start server on custom port
+//! kftray-mcp --port 8080
+//!
+//! # Start server bound to specific address
+//! kftray-mcp --host 0.0.0.0 --port 8080
+//! ```
+//!
+//! # MCP Endpoints
+//!
+//! - `POST /mcp` - JSON-RPC requests
+//! - `GET /mcp` - SSE event stream
+//! - `DELETE /mcp` - Terminate session
+//! - `GET /health` - Health check
+
+use std::net::{
+    IpAddr,
+    SocketAddr,
+};
+
+use clap::Parser;
+use log::{
+    LevelFilter,
+    info,
+};
+
+/// KFtray MCP Server - Kubernetes port-forwarding via Model Context Protocol
+#[derive(Parser, Debug)]
+#[command(
+    name = "kftray-mcp",
+    version,
+    about = "MCP server for managing Kubernetes port-forwards",
+    long_about = "A Model Context Protocol (MCP) server that exposes kftray functionality \
+                  to LLMs, enabling AI-assisted Kubernetes port-forward management."
+)]
+struct Args {
+    /// Host address to bind to
+    #[arg(short = 'H', long, default_value = "127.0.0.1")]
+    host: IpAddr,
+
+    /// Port to listen on
+    #[arg(short, long, default_value = "3000")]
+    port: u16,
+
+    /// Log level (error, warn, info, debug, trace, off)
+    #[arg(short, long, default_value = "info")]
+    log_level: LevelFilter,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+
+    // Initialize logging
+    env_logger::Builder::new()
+        .filter_level(args.log_level)
+        .format_timestamp_secs()
+        .init();
+
+    kftray_portforward::ssl::install_default_keyring_store();
+    kftray_portforward::ssl::ensure_crypto_provider_installed();
+
+    kftray_mcp::init_database().await?;
+
+    let addr = SocketAddr::new(args.host, args.port);
+
+    info!("Starting KFtray MCP Server v{}", env!("CARGO_PKG_VERSION"));
+    info!(
+        "Protocol version: {}",
+        kftray_mcp::protocol::MCP_PROTOCOL_VERSION
+    );
+    info!("Listening on http://{}", addr);
+    info!("");
+    info!("Available tools:");
+    for tool in kftray_mcp::tools::get_all_tools() {
+        info!(
+            "  - {}: {}",
+            tool.name,
+            tool.description.unwrap_or_default()
+        );
+    }
+    info!("");
+    info!("Endpoints:");
+    info!("  POST   /mcp    - JSON-RPC requests");
+    info!("  GET    /mcp    - SSE event stream");
+    info!("  DELETE /mcp    - Terminate session");
+    info!("  GET    /health - Health check");
+    info!("");
+
+    kftray_mcp::server::start_server(addr).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_level_rejects_an_unknown_name_and_ignores_case() {
+        assert!(Args::try_parse_from(["kftray-mcp", "--log-level", "warning"]).is_err());
+
+        let args = Args::try_parse_from(["kftray-mcp", "--log-level", "WARN"]).unwrap();
+        assert_eq!(args.log_level, LevelFilter::Warn);
+        let args = Args::try_parse_from(["kftray-mcp"]).unwrap();
+        assert_eq!(args.log_level, LevelFilter::Info);
+    }
+}

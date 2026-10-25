@@ -1,0 +1,375 @@
+import { memo, useState } from 'react'
+import {
+  ClipboardIcon,
+  ExternalLinkIcon,
+  Info,
+  TriangleAlert,
+  Users,
+} from 'lucide-react'
+
+import { Box, Flex, IconButton, Table, Text } from '@chakra-ui/react'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { open as openShell } from '@tauri-apps/plugin-shell'
+
+import { HttpLogsConfigModal } from '@/components/HttpLogsConfigModal'
+import { ActionsMenu } from '@/components/PortForwardTable/GroupAccordion/PortForwardRow/ActionsMenu'
+import { ConfigDetailsTooltip } from '@/components/PortForwardTable/GroupAccordion/PortForwardRow/ConfigDetailsTooltip'
+import { DeleteConfigDialog } from '@/components/PortForwardTable/GroupAccordion/PortForwardRow/DeleteConfigDialog'
+import {
+  formatConfigDetails,
+  getConfigDetails,
+  getStatusInfo,
+} from '@/components/PortForwardTable/GroupAccordion/PortForwardRow/statusInfo'
+import {
+  allHttpLogsEnabledQueryKey,
+  httpLogsEnabledQueryKey,
+  useHttpLogsEnabled,
+  useSetHttpLogsEnabled,
+} from '@/components/PortForwardTable/GroupAccordion/PortForwardRow/useHttpLogsEnabled'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Switch } from '@/components/ui/switch'
+import { toaster } from '@/components/ui/toaster'
+import { Tooltip } from '@/components/ui/tooltip'
+import { configsQuery } from '@/hooks/useConfigs'
+import { useCopyToClipboard } from '@/hooks/useCopyToClipboard'
+import { invoke } from '@/lib/tauri'
+import type {
+  Config,
+  PendingConfigAction,
+  PortForwardToggleAction,
+} from '@/types'
+
+import '../../styles.css'
+
+const HTTP_URL_PATTERN = /^https?:\/\//i
+
+function buildLocalUrl(config: Config): string {
+  if (config.workload_type === 'expose') {
+    if (config.exposure_type === 'public') {
+      const protocol = config.cert_manager_enabled ? 'https' : 'http'
+
+      return `${protocol}://${config.alias}`
+    }
+
+    const host = config.local_address || '127.0.0.1'
+
+    return `http://${host}:${config.local_port}`
+  }
+
+  const baseUrl = config.domain_enabled
+    ? config.alias
+    : config.local_address || 'localhost'
+
+  return `http://${baseUrl}:${config.local_port}`
+}
+
+interface PortForwardRowProps {
+  config: Config
+  deleteConfigs: (ids: number[]) => Promise<boolean>
+  handleEditConfig: (id: number) => Promise<void>
+  handleDuplicateConfig: (id: number) => Promise<void>
+  onSelectionChange: (config: Config, isSelected: boolean) => void
+  selected: boolean
+  pendingAction: PendingConfigAction | null
+  activePod: string | null
+  toggleConfigForward: (
+    config: Config,
+    action: PortForwardToggleAction,
+  ) => Promise<void>
+}
+
+function PortForwardRowComponent({
+  config,
+  deleteConfigs,
+  handleEditConfig,
+  handleDuplicateConfig,
+  selected,
+  onSelectionChange,
+  pendingAction,
+  activePod,
+  toggleConfigForward,
+}: PortForwardRowProps) {
+  const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
+  const [isHttpLogsConfigOpen, setIsHttpLogsConfigOpen] = useState(false)
+  const isPending = pendingAction !== null
+
+  const queryClient = useQueryClient()
+  const { data: httpLogsEnabled } = useHttpLogsEnabled(config.id)
+  const setHttpLogsEnabled = useSetHttpLogsEnabled(config.id)
+
+  const status = getStatusInfo(config, pendingAction, activePod)
+  const configDetails = getConfigDetails(config, activePod)
+
+  const inspectLogs = useMutation({
+    mutationFn: (logFileName: string) =>
+      invoke('open_log_file', { logFileName }),
+    meta: { errorToast: { title: 'Error opening log file', duration: 1000 } },
+  })
+
+  const openUrl = useMutation({
+    mutationFn: (url: string) => openShell(url),
+    meta: { errorToast: { title: 'Failed to open URL' } },
+  })
+
+  const addPodForwards = useMutation({
+    mutationFn: () =>
+      invoke<number>('add_headless_pod_configs_cmd', { id: config.id }),
+    onSuccess: added => {
+      queryClient.invalidateQueries({ queryKey: configsQuery.queryKey })
+      queryClient.invalidateQueries({ queryKey: allHttpLogsEnabledQueryKey })
+      toaster.success({
+        title: 'Pod forwards',
+        description:
+          added === 0
+            ? 'Every pod already has a forward.'
+            : `Added ${added} pod ${added === 1 ? 'forward' : 'forwards'}.`,
+        duration: 3000,
+      })
+    },
+    meta: {
+      errorToast: { title: 'Failed to add pod forwards', duration: 5000 },
+    },
+  })
+
+  const copyPodName = useCopyToClipboard({
+    title: 'Pod name copied',
+    description: podName => `${podName} copied to clipboard`,
+  })
+
+  const copyConfigDetails = useCopyToClipboard({
+    title: 'Config details copied',
+    description: () => 'All configuration details copied to clipboard',
+  })
+
+  const handleOpenUrl = (url: string) => {
+    if (HTTP_URL_PATTERN.test(url)) {
+      openUrl.mutate(url)
+    }
+  }
+
+  const togglePortForwarding = async (isChecked: boolean) => {
+    await toggleConfigForward(config, isChecked ? 'starting' : 'stopping')
+  }
+
+  const handleDeleteConfirm = async () => {
+    const success = await deleteConfigs([config.id])
+
+    if (success) {
+      setIsDeleteDialogOpen(false)
+    }
+  }
+
+  return (
+    <>
+      <Table.Row
+        data-testid='config-row'
+        data-alias={config.alias}
+        data-state={config.is_running ? 'running' : 'stopped'}
+        className='table-row'
+      >
+        <Table.Cell className='table-cell'>
+          <Flex align='center' gap={1.5}>
+            <Tooltip
+              content={
+                <ConfigDetailsTooltip status={status} details={configDetails} />
+              }
+            >
+              <Flex align='center' gap={1.5}>
+                <Checkbox
+                  size='xs'
+                  checked={selected}
+                  onCheckedChange={e =>
+                    onSelectionChange(config, e.checked === true)
+                  }
+                  className='checkbox'
+                  inputProps={{ 'aria-label': `Select ${config.alias}` }}
+                />
+
+                <IconButton
+                  size='xs'
+                  variant='ghost'
+                  aria-label='Copy configuration details'
+                  onClick={() =>
+                    copyConfigDetails.mutate(
+                      formatConfigDetails(status, configDetails),
+                    )
+                  }
+                  className='icon-button'
+                  color={status.color}
+                >
+                  <Box as={Info} width='12px' height='12px' />
+                </IconButton>
+
+                <Text className='text-normal' truncate maxWidth='100%'>
+                  {config.alias}
+                </Text>
+              </Flex>
+            </Tooltip>
+
+            {config.last_error && (
+              <Tooltip
+                content={
+                  <Box p={1} maxWidth='320px'>
+                    <Text fontSize='xs' fontWeight='medium'>
+                      {config.is_running
+                        ? 'Connections to the pod fail'
+                        : 'Stopped after an error'}
+                    </Text>
+                    <Text fontSize='xs' color='fg.muted' wordBreak='break-word'>
+                      {config.last_error}
+                    </Text>
+                  </Box>
+                }
+              >
+                <Box
+                  as={TriangleAlert}
+                  data-testid='config-error'
+                  aria-label={`Connection error for ${config.alias}`}
+                  width='12px'
+                  height='12px'
+                  flexShrink={0}
+                  color='warning.fg'
+                />
+              </Tooltip>
+            )}
+
+            {config.owned_elsewhere && (
+              <Tooltip content='Running in another kftray process. Stop it there.'>
+                <Box
+                  as={Users}
+                  data-testid='config-owned-elsewhere'
+                  aria-label={`${config.alias} runs in another kftray process`}
+                  width='12px'
+                  height='12px'
+                  flexShrink={0}
+                  color='fg.muted'
+                />
+              </Tooltip>
+            )}
+          </Flex>
+        </Table.Cell>
+
+        <Table.Cell className='table-cell'>
+          <Text>{config.local_port}</Text>
+        </Table.Cell>
+
+        <Table.Cell className='table-cell'>
+          <Flex align='center' gap={1.5}>
+            <Switch
+              data-testid='config-toggle'
+              size='sm'
+              checked={config.is_running}
+              onCheckedChange={state =>
+                void togglePortForwarding(state.checked)
+              }
+              disabled={isPending || config.owned_elsewhere}
+              data-loading={isPending ? '' : undefined}
+              unstyled={true}
+              className='switch'
+              inputProps={{ 'aria-label': `Port forward ${config.alias}` }}
+            />
+
+            <Flex
+              align='center'
+              gap={0.5}
+              mr={-10}
+              minWidth='48px'
+              justifyContent='flex-end'
+            >
+              {config.is_running &&
+              !(
+                config.workload_type === 'expose' &&
+                config.exposure_protocol === 'tcp'
+              ) ? (
+                <Tooltip content='Open in browser'>
+                  <IconButton
+                    size='2xs'
+                    variant='ghost'
+                    aria-label='Open URL'
+                    onClick={() => handleOpenUrl(buildLocalUrl(config))}
+                    className='icon-button'
+                  >
+                    <ExternalLinkIcon size={10} />
+                  </IconButton>
+                </Tooltip>
+              ) : (
+                <Box width='24px' height='24px' />
+              )}
+
+              {config.is_running && activePod ? (
+                <Tooltip
+                  content={
+                    <Box p={1}>
+                      <Text fontSize='xs' fontWeight='medium'>
+                        Status: {status.status}
+                      </Text>
+                      <Text fontSize='xs' color='fg.muted'>
+                        Pod: {activePod} (click to copy)
+                      </Text>
+                    </Box>
+                  }
+                >
+                  <IconButton
+                    size='2xs'
+                    variant='ghost'
+                    onClick={() => copyPodName.mutate(activePod)}
+                    aria-label='Copy Pod Name'
+                    className='icon-button'
+                  >
+                    <ClipboardIcon size={10} />
+                  </IconButton>
+                </Tooltip>
+              ) : (
+                <Box width='24px' height='24px' />
+              )}
+            </Flex>
+          </Flex>
+        </Table.Cell>
+
+        <Table.Cell className='table-cell'>
+          <ActionsMenu
+            protocol={config.protocol}
+            isPending={isPending}
+            httpLogsEnabled={httpLogsEnabled}
+            onEdit={() => void handleEditConfig(config.id)}
+            onDuplicate={() => void handleDuplicateConfig(config.id)}
+            onOpenDeleteDialog={() => setIsDeleteDialogOpen(true)}
+            onToggleHttpLogs={() => setHttpLogsEnabled.mutate(!httpLogsEnabled)}
+            onInspectLogs={() =>
+              inspectLogs.mutate(`${config.id}_${config.local_port}.http`)
+            }
+            onOpenHttpLogsConfig={() => setIsHttpLogsConfigOpen(true)}
+            onAddPodForwards={
+              config.workload_type === 'service' && config.protocol === 'tcp'
+                ? () => addPodForwards.mutate()
+                : undefined
+            }
+            isAddingPodForwards={addPodForwards.isPending}
+          />
+        </Table.Cell>
+      </Table.Row>
+
+      {isDeleteDialogOpen && (
+        <DeleteConfigDialog
+          isPending={isPending}
+          onConfirm={() => void handleDeleteConfirm()}
+          onClose={() => setIsDeleteDialogOpen(false)}
+        />
+      )}
+
+      {isHttpLogsConfigOpen && (
+        <HttpLogsConfigModal
+          configId={config.id}
+          onClose={() => setIsHttpLogsConfigOpen(false)}
+          onSaved={() =>
+            queryClient.invalidateQueries({
+              queryKey: httpLogsEnabledQueryKey(config.id),
+            })
+          }
+        />
+      )}
+    </>
+  )
+}
+
+export const PortForwardRow = memo(PortForwardRowComponent)

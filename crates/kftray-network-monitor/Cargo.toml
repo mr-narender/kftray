@@ -1,0 +1,21 @@
+[package]
+name = "kftray-network-monitor"
+version = "0.33.0"
+authors = ["Henrique Cavarsan <hencavarsan@gmail.com>"]
+edition = "2024"
+description = "Network monitoring and management for KFtray"
+homepage = "https://kftray.app"
+repository = "https://github.com/hcavarsan/kftray"
+license = "GPL-3.0"
+
+[dependencies]
+futures = { workspace = true }
+kftray-commons = { workspace = true }
+kftray-portforward = { workspace = true }
+kftray-telemetry = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+tempfile = { workspace = true }

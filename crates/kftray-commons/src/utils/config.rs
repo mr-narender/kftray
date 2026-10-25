@@ -1,0 +1,3053 @@
+use futures::stream::StreamExt;
+use log::{
+    error,
+    info,
+};
+use serde_json::json;
+use sqlx::{
+    Row,
+    SqliteConnection,
+    SqlitePool,
+};
+
+use crate::db::{
+    create_db_table,
+    get_db_pool,
+};
+use crate::hostsfile::HostsFile;
+use crate::migration::migrate_configs;
+use crate::models::config_model::Config;
+use crate::utils::config_view::{
+    normalize_tags,
+    validate_tags,
+};
+use crate::utils::db_mode::{
+    DatabaseManager,
+    DatabaseMode,
+};
+use crate::utils::error::DbError;
+
+async fn remove_configs_from_shortcuts(
+    conn: &mut SqliteConnection, ids: &[i64],
+) -> Result<(), DbError> {
+    let has_shortcuts =
+        sqlx::query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'shortcuts'")
+            .fetch_optional(&mut *conn)
+            .await?
+            .is_some();
+    if !has_shortcuts {
+        return Ok(());
+    }
+
+    let rows = sqlx::query("SELECT id, action_data FROM shortcuts WHERE action_data IS NOT NULL")
+        .fetch_all(&mut *conn)
+        .await?;
+    for row in rows {
+        let shortcut_id: i64 = row.try_get("id")?;
+        let data: String = row.try_get("action_data")?;
+        let Ok(mut action_data) = serde_json::from_str::<serde_json::Value>(&data) else {
+            continue;
+        };
+        let Some(targets) = action_data
+            .get_mut("config_ids")
+            .and_then(|v| v.as_array_mut())
+        else {
+            continue;
+        };
+        let before = targets.len();
+        targets.retain(|target| !target.as_i64().is_some_and(|id| ids.contains(&id)));
+        if targets.len() == before {
+            continue;
+        }
+
+        let query = if targets.is_empty() {
+            sqlx::query("DELETE FROM shortcuts WHERE id = ?1").bind(shortcut_id)
+        } else {
+            sqlx::query("UPDATE shortcuts SET action_data = ?2 WHERE id = ?1")
+                .bind(shortcut_id)
+                .bind(action_data.to_string())
+        };
+        query.execute(&mut *conn).await.map_err(|e| {
+            DbError::QueryFailed(format!("Failed to update shortcut {shortcut_id}: {e}"))
+        })?;
+    }
+    Ok(())
+}
+
+pub async fn delete_config_with_pool(id: i64, pool: &SqlitePool) -> Result<(), DbError> {
+    delete_configs_with_pool(vec![id], pool).await
+}
+
+pub async fn delete_config(id: i64) -> Result<(), String> {
+    let pool = get_db_pool().await.map_err(|e| e.to_string())?;
+    delete_config_with_pool(id, &pool)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub async fn delete_configs_with_pool(ids: Vec<i64>, pool: &SqlitePool) -> Result<(), DbError> {
+    let mut transaction = pool.begin().await?;
+    for id in &ids {
+        sqlx::query("DELETE FROM configs WHERE id = ?1")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| {
+                DbError::QueryFailed(format!("Failed to delete config with id {id}: {e}"))
+            })?;
+    }
+    remove_configs_from_shortcuts(&mut transaction, &ids).await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+pub async fn delete_configs(ids: Vec<i64>) -> Result<(), String> {
+    let pool = get_db_pool().await.map_err(|e| e.to_string())?;
+    delete_configs_with_pool(ids, &pool)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub async fn delete_all_configs_with_pool(pool: &SqlitePool) -> Result<(), DbError> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query("DELETE FROM configs")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| DbError::QueryFailed(format!("Failed to delete all configs: {e}")))?;
+    Ok(())
+}
+
+pub async fn delete_all_configs() -> Result<(), String> {
+    let pool = get_db_pool().await.map_err(|e| e.to_string())?;
+    delete_all_configs_with_pool(&pool)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Insert a new config and return its assigned ID.
+pub async fn insert_config_with_pool(config: Config, pool: &SqlitePool) -> Result<i64, String> {
+    let config = prepare_config(config)?;
+    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+
+    create_db_table(pool).await.map_err(|e| e.to_string())?;
+
+    // Validate that file mode won't conflict with memory mode ID range
+    let memory_id_start = std::env::var("KFTRAY_MEMORY_ID_START")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(MEMORY_ID_START);
+
+    let next_id_row =
+        sqlx::query("SELECT COALESCE(MAX(id), 0) + 1 as next_id FROM configs WHERE id < ?")
+            .bind(memory_id_start)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| e.to_string())?;
+
+    let next_id: i64 = next_id_row.try_get("next_id").map_err(|e| e.to_string())?;
+
+    if next_id >= memory_id_start {
+        return Err(format!(
+            "ID conflict detected: next file mode ID ({next_id}) would exceed memory mode start ({memory_id_start})"
+        ));
+    }
+
+    let data = json!(config).to_string();
+    let result = sqlx::query("INSERT INTO configs (data) VALUES (?1)")
+        .bind(data)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let inserted_id = result.last_insert_rowid();
+    sync_http_logs_config_from_config(&config, inserted_id, pool).await?;
+
+    Ok(inserted_id)
+}
+
+pub(crate) async fn insert_config_with_pool_and_mode(
+    config: Config, pool: &SqlitePool, mode: DatabaseMode,
+) -> Result<i64, String> {
+    match mode {
+        DatabaseMode::Memory => {
+            let config = prepare_config(config)?;
+            let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+            create_db_table(pool).await.map_err(|e| e.to_string())?;
+
+            let next_id = get_next_memory_id(pool).await?;
+            let data = json!(config).to_string();
+
+            sqlx::query("INSERT INTO configs (id, data) VALUES (?1, ?2)")
+                .bind(next_id)
+                .bind(data)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            sync_http_logs_config_from_config(&config, next_id, pool).await?;
+            Ok(next_id)
+        }
+        DatabaseMode::File => insert_config_with_pool(config, pool).await,
+    }
+}
+
+const MEMORY_ID_START: i64 = 100000;
+
+async fn get_next_memory_id(pool: &SqlitePool) -> Result<i64, String> {
+    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+
+    let memory_id_start = std::env::var("KFTRAY_MEMORY_ID_START")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(MEMORY_ID_START);
+
+    // Validate that memory ID range doesn't conflict with existing file-based IDs
+    let file_max_row =
+        sqlx::query("SELECT COALESCE(MAX(id), 0) as max_id FROM configs WHERE id < ?")
+            .bind(memory_id_start)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| e.to_string())?;
+
+    let file_max_id: i64 = file_max_row.try_get("max_id").map_err(|e| e.to_string())?;
+
+    if file_max_id >= memory_id_start {
+        return Err(format!(
+            "ID conflict detected: file mode max ID ({file_max_id}) exceeds memory mode start ({memory_id_start})"
+        ));
+    }
+
+    let row = sqlx::query("SELECT COALESCE(MAX(id), ?) as max_id FROM configs WHERE id >= ?")
+        .bind(memory_id_start - 1)
+        .bind(memory_id_start)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let max_id: i64 = row.try_get("max_id").map_err(|e| e.to_string())?;
+
+    max_id
+        .checked_add(1)
+        .ok_or_else(|| "ID overflow: maximum ID value reached".to_string())
+}
+
+/// Insert a new config and return its assigned ID.
+pub async fn insert_config(config: Config) -> Result<i64, String> {
+    let pool = get_db_pool().await.map_err(|e| e.to_string())?;
+    insert_config_with_pool(config, &pool).await
+}
+
+pub async fn read_configs_with_pool(pool: &SqlitePool) -> Result<Vec<Config>, String> {
+    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+    let rows = sqlx::query("SELECT id, data FROM configs")
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let config_results: Vec<Result<Config, String>> = futures::stream::iter(rows)
+        .map(|row| {
+            let id: Result<i64, String> = row.try_get("id").map_err(|e| e.to_string());
+            let data: Result<String, String> = row.try_get("data").map_err(|e| e.to_string());
+            async move {
+                let id = id?;
+                let data = data?;
+                let mut config = serde_json::from_str::<Config>(&data)
+                    .map_err(|_| "Failed to decode config".to_string())?;
+                config.id = Some(id);
+                Ok(config)
+            }
+        })
+        .buffer_unordered(8)
+        .collect::<Vec<Result<Config, String>>>()
+        .await;
+
+    let mut configs = Vec::new();
+    for result in config_results {
+        match result {
+            Ok(config) => configs.push(config),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(configs)
+}
+
+pub async fn read_configs() -> Result<Vec<Config>, String> {
+    let pool = get_db_pool().await.map_err(|e| e.to_string())?;
+    read_configs_with_pool(&pool).await
+}
+
+pub(crate) async fn clean_all_custom_hosts_entries_with_pool(
+    pool: &SqlitePool,
+) -> Result<(), String> {
+    clean_all_custom_hosts_entries_with_pool_and_path(pool, None).await
+}
+
+async fn clean_all_custom_hosts_entries_with_pool_and_path(
+    pool: &SqlitePool, custom_hosts_path: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let configs = read_configs_with_pool(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    for config in configs {
+        let hostfile_comment = format!(
+            "kftray custom host for {} - {}",
+            config.service.unwrap_or_default(),
+            config.id.unwrap_or_default()
+        );
+        let hosts_file = HostsFile::new(&hostfile_comment);
+        let result = match custom_hosts_path {
+            Some(path) => hosts_file.write_to(path),
+            None => hosts_file.write(),
+        };
+        result
+            .map_err(|e| format!("Failed to write to the hostfile for {hostfile_comment}: {e}"))?;
+    }
+    Ok(())
+}
+
+pub async fn clean_all_custom_hosts_entries() -> Result<(), String> {
+    let pool = get_db_pool().await.map_err(|e| e.to_string())?;
+    clean_all_custom_hosts_entries_with_pool(&pool).await
+}
+
+pub async fn get_configs() -> Result<Vec<Config>, String> {
+    read_configs().await
+}
+
+pub(crate) async fn get_config_with_pool(id: i64, pool: &SqlitePool) -> Result<Config, String> {
+    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+    let row = sqlx::query("SELECT id, data FROM configs WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| e.to_string())?;
+    match row {
+        Some(row) => {
+            let id: i64 = row.try_get("id").map_err(|e| e.to_string())?;
+            let data: String = row.try_get("data").map_err(|e| e.to_string())?;
+            let mut config: Config =
+                serde_json::from_str(&data).map_err(|e| format!("Failed to parse config: {e}"))?;
+            config.id = Some(id);
+            Ok(config)
+        }
+        None => Err(format!("No config found with id: {id}")),
+    }
+}
+
+pub async fn get_config(id: i64) -> Result<Config, String> {
+    let pool = get_db_pool().await.map_err(|e| e.to_string())?;
+    get_config_with_pool(id, &pool).await
+}
+
+pub(crate) async fn update_config_with_pool(
+    config: Config, pool: &SqlitePool,
+) -> Result<(), String> {
+    let config = prepare_config(config)?;
+    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+    let data = json!(config).to_string();
+    sqlx::query("UPDATE configs SET data = ?1 WHERE id = ?2")
+        .bind(data)
+        .bind(config.id.unwrap())
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if let Some(config_id) = config.id {
+        sync_http_logs_config_from_config(&config, config_id, pool).await?;
+    }
+
+    Ok(())
+}
+
+pub async fn update_config(config: Config) -> Result<(), String> {
+    let pool = get_db_pool().await.map_err(|e| e.to_string())?;
+    update_config_with_pool(config, &pool).await
+}
+
+pub(crate) async fn export_configs_with_pool(pool: &SqlitePool) -> Result<String, String> {
+    let configs: Vec<Config> = read_configs_with_pool(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|c| c.prepare_for_export())
+        .collect();
+
+    serde_json::to_string_pretty(&configs).map_err(|e| e.to_string())
+}
+
+pub async fn export_configs() -> Result<String, String> {
+    let pool = get_db_pool().await.map_err(|e| e.to_string())?;
+    export_configs_with_pool(&pool).await
+}
+
+fn validate_imported_config(config: &Config) -> Result<(), String> {
+    validate_tags(&normalize_tags(config.tags.clone())?)?;
+
+    if config.namespace.is_empty() {
+        return Err("Namespace is required and cannot be empty".to_string());
+    }
+
+    if !matches!(config.protocol.as_str(), "tcp" | "udp") {
+        return Err(format!(
+            "Protocol must be 'tcp' or 'udp', got '{}'",
+            config.protocol
+        ));
+    }
+
+    match config.workload_type.as_deref() {
+        Some("service") => {
+            if config.service.is_none() || config.service.as_ref().unwrap().is_empty() {
+                return Err("Service name is required for service workload type".to_string());
+            }
+        }
+        Some("pod") => {
+            if config.target.is_none() || config.target.as_ref().unwrap().is_empty() {
+                return Err(
+                    "Target (pod label selector) is required for pod workload type".to_string(),
+                );
+            }
+        }
+        Some("proxy") => {
+            if config.remote_address.is_none() || config.remote_address.as_ref().unwrap().is_empty()
+            {
+                return Err("Remote address is required for proxy workload type".to_string());
+            }
+        }
+        Some("expose") => {
+            if config.alias.is_none() || config.alias.as_ref().unwrap().is_empty() {
+                return Err("Alias/Domain is required for expose workload type".to_string());
+            }
+            if config.local_port.is_none() {
+                return Err("Local port is required for expose workload type".to_string());
+            }
+            // Validate cert-manager requirements if enabled
+            if config.exposure_type.as_deref() == Some("public")
+                && config.cert_manager_enabled.unwrap_or(false)
+                && (config.cert_issuer.is_none() || config.cert_issuer.as_ref().unwrap().is_empty())
+            {
+                return Err(
+                    "Certificate issuer is required when cert-manager is enabled".to_string(),
+                );
+            }
+            match config.exposure_protocol.as_deref() {
+                None | Some("http") => {}
+                Some("tcp") if config.exposes_tcp() => {}
+                Some("tcp") => {
+                    return Err(
+                        "Exposure protocol 'tcp' needs a cluster exposure. Public exposes carry \
+                         HTTP"
+                            .to_string(),
+                    );
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "Exposure protocol must be 'http' or 'tcp', got '{other}'"
+                    ));
+                }
+            }
+        }
+        Some(workload_type) => {
+            return Err(format!(
+                "Invalid workload type: {workload_type}. Must be 'service', 'pod', 'proxy', or 'expose'"
+            ));
+        }
+        None => {
+            return Err("Workload type is required".to_string());
+        }
+    }
+
+    if let Some(max_file_size) = config.http_logs_max_file_size {
+        if max_file_size == 0 {
+            return Err("HTTP logs max file size must be greater than 0".to_string());
+        }
+        if max_file_size > 100 * 1024 * 1024 {
+            return Err("HTTP logs max file size cannot exceed 100MB".to_string());
+        }
+    }
+
+    if let Some(retention_days) = config.http_logs_retention_days {
+        if retention_days == 0 {
+            return Err("HTTP logs retention days must be greater than 0".to_string());
+        }
+        if retention_days > 365 {
+            return Err("HTTP logs retention days cannot exceed 365 days".to_string());
+        }
+    }
+
+    Ok(())
+}
+
+fn kubeconfig_or_default(config: &Config) -> &str {
+    match config.kubeconfig.as_deref().map(str::trim) {
+        None | Some("") => "default",
+        Some(kubeconfig) => kubeconfig,
+    }
+}
+
+fn configs_match_identity(existing: &Config, incoming: &Config) -> bool {
+    if existing.context != incoming.context
+        || existing.namespace != incoming.namespace
+        || existing.workload_type != incoming.workload_type
+        || existing.protocol != incoming.protocol
+        || kubeconfig_or_default(existing) != kubeconfig_or_default(incoming)
+    {
+        return false;
+    }
+
+    let target_matches = match existing.workload_type.as_deref() {
+        Some("service") => existing.service == incoming.service,
+        Some("pod") => existing.target == incoming.target,
+        Some("proxy") => existing.remote_address == incoming.remote_address,
+        Some("expose") => {
+            return existing.alias.as_deref().map(str::trim)
+                == incoming.alias.as_deref().map(str::trim)
+                && (incoming.local_port == Some(0) || existing.local_port == incoming.local_port);
+        }
+        _ => {
+            return existing.service == incoming.service
+                && existing.target == incoming.target
+                && existing.remote_address == incoming.remote_address;
+        }
+    };
+
+    let has_explicit_ports = existing.local_port.is_some()
+        && incoming.local_port.is_some()
+        && existing.local_port != Some(0)
+        && incoming.local_port != Some(0);
+
+    if has_explicit_ports {
+        target_matches
+            && existing.local_port == incoming.local_port
+            && existing.remote_port == incoming.remote_port
+    } else {
+        target_matches
+    }
+}
+
+fn local_address_or_default(config: &Config) -> &str {
+    config.local_address.as_deref().unwrap_or("127.0.0.1")
+}
+
+fn domain_alias(config: &Config) -> Option<&str> {
+    if config.domain_enabled.unwrap_or_default() {
+        config.alias.as_deref().map(str::trim)
+    } else {
+        None
+    }
+}
+
+fn same_local_endpoint(existing: &Config, incoming: &Config) -> bool {
+    local_address_or_default(existing) == local_address_or_default(incoming)
+        && domain_alias(existing) == domain_alias(incoming)
+}
+
+#[derive(Clone, Copy)]
+enum IdentityMatch {
+    None,
+    Saved(usize, u8),
+    SavedMoreThanOnce,
+}
+
+fn find_identity_match(configs: &[Config], incoming: &Config) -> IdentityMatch {
+    let rank = |c: &Config| match (
+        c.remote_port == incoming.remote_port,
+        c.local_port == incoming.local_port,
+    ) {
+        (true, true) if same_local_endpoint(c, incoming) => 3,
+        (true, true) => 2,
+        (true, false) => 1,
+        (false, _) => 0,
+    };
+
+    let mut best: Option<(usize, u8)> = None;
+    let mut ambiguous = false;
+    for (index, config) in configs.iter().enumerate() {
+        if !configs_match_identity(config, incoming) {
+            continue;
+        }
+        let score = rank(config);
+        match best {
+            Some((_, best_score)) if score < best_score => {}
+            Some((_, best_score)) if score == best_score => ambiguous |= score < 3,
+            _ => {
+                best = Some((index, score));
+                ambiguous = false;
+            }
+        }
+    }
+
+    match best {
+        Some((index, score)) if !ambiguous => IdentityMatch::Saved(index, score),
+        Some((_, 1)) => IdentityMatch::SavedMoreThanOnce,
+        _ => IdentityMatch::None,
+    }
+}
+
+fn assign_identity_matches(
+    saved: &[Config], incoming: Vec<Config>,
+) -> Vec<(Config, Option<&Config>)> {
+    let matches: Vec<_> = incoming
+        .iter()
+        .map(|config| find_identity_match(saved, config))
+        .collect();
+
+    let mut winners: Vec<Option<(usize, u8)>> = vec![None; saved.len()];
+    for (position, m) in matches.iter().enumerate() {
+        if let IdentityMatch::Saved(index, score) = *m
+            && winners[index].is_none_or(|(_, best)| score > best)
+        {
+            winners[index] = Some((position, score));
+        }
+    }
+
+    incoming
+        .into_iter()
+        .zip(matches)
+        .enumerate()
+        .filter_map(|(position, (config, m))| match m {
+            IdentityMatch::SavedMoreThanOnce => {
+                info!("Several saved configs match an imported config, skipping it");
+                None
+            }
+            IdentityMatch::Saved(index, _)
+                if winners[index].is_some_and(|(winner, _)| winner == position) =>
+            {
+                Some((config, Some(&saved[index])))
+            }
+            _ => Some((config, None)),
+        })
+        .collect()
+}
+
+fn configs_are_identical(existing: &Config, incoming: &Config) -> bool {
+    let mut existing_clone = existing.clone();
+    let mut incoming_clone = incoming.clone();
+
+    existing_clone.id = None;
+    incoming_clone.id = None;
+
+    existing_clone == incoming_clone
+}
+
+async fn merge_config_with_existing(
+    config: Config, existing: Option<&Config>, pool: &SqlitePool,
+) -> Result<(), String> {
+    if let Some(existing) = existing {
+        info!(
+            "Found matching config ID={}, checking if update needed",
+            existing.id.unwrap_or(-1)
+        );
+        if configs_are_identical(existing, &config) {
+            info!("Config is identical, skipping");
+            return Ok(());
+        }
+
+        info!("Config has changes, updating");
+        let mut updated_config = config;
+        updated_config.id = existing.id;
+
+        if updated_config.alias.is_none() || updated_config.alias.as_deref() == Some("") {
+            updated_config.alias = existing.alias.clone();
+        }
+
+        if updated_config.local_port.is_none() || updated_config.local_port == Some(0) {
+            updated_config.local_port = existing.local_port;
+        }
+
+        update_config_with_pool(updated_config, pool).await?;
+    } else {
+        info!("No matching config found, inserting new config");
+        insert_config_with_pool(config, pool).await?;
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn import_configs_with_pool(
+    json: String, pool: &SqlitePool,
+) -> Result<(), String> {
+    let configs = parse_import_configs(&json)?;
+
+    let existing_configs = read_configs_with_pool(pool).await?;
+
+    for (config, existing) in assign_identity_matches(&existing_configs, configs) {
+        merge_config_with_existing(config, existing, pool)
+            .await
+            .map_err(|e| format!("Failed to merge config: {e}"))?;
+    }
+
+    if let Err(e) = migrate_configs(Some(pool)).await {
+        return Err(format!("Error migrating configs: {e}"));
+    }
+
+    Ok(())
+}
+
+pub fn parse_import_configs(json: &str) -> Result<Vec<Config>, String> {
+    let mut configs = parse_config_json(json)?;
+    for config in &mut configs {
+        validate_imported_config(config).map_err(|e| format!("Invalid config: {e}"))?;
+        if config.workload_type.as_deref() == Some("pod") && config.service.is_none() {
+            config.service = Some(String::new());
+        }
+    }
+    Ok(configs)
+}
+
+fn parse_config_json(json: &str) -> Result<Vec<Config>, String> {
+    let parsed: Vec<Config> = match serde_json::from_str(json) {
+        Ok(configs) => configs,
+        Err(e) => {
+            info!("Failed to parse JSON as Vec<Config>: {e}. Trying as single Config.");
+            let config = serde_json::from_str::<Config>(json)
+                .map_err(|e| format!("Failed to parse config: {e}"))?;
+            vec![config]
+        }
+    };
+
+    Ok(dedup_configs(parsed))
+}
+
+fn dedup_configs(configs: Vec<Config>) -> Vec<Config> {
+    let mut unique: Vec<Config> = Vec::with_capacity(configs.len());
+    for config in configs {
+        match unique.iter().position(|c| {
+            configs_match_identity(c, &config)
+                && c.remote_port == config.remote_port
+                && same_local_endpoint(c, &config)
+        }) {
+            Some(index) => unique[index] = config,
+            None => unique.push(config),
+        }
+    }
+    unique
+}
+
+async fn merge_config_with_existing_and_mode(
+    config: Config, existing: Option<&Config>, pool: &SqlitePool, mode: DatabaseMode,
+) -> Result<i64, String> {
+    if let Some(existing) = existing {
+        let id = existing
+            .id
+            .ok_or_else(|| "Matching config has no id".to_string())?;
+        info!("Found matching config ID={id}, checking if update needed");
+        if configs_are_identical(existing, &config) {
+            info!("Config is identical, skipping");
+            return Ok(id);
+        }
+
+        info!("Config has changes, updating");
+        let mut updated_config = config;
+        updated_config.id = existing.id;
+
+        if updated_config.alias.is_none() || updated_config.alias.as_deref() == Some("") {
+            updated_config.alias = existing.alias.clone();
+        }
+
+        if updated_config.local_port.is_none() || updated_config.local_port == Some(0) {
+            updated_config.local_port = existing.local_port;
+        }
+
+        update_config_with_pool(updated_config, pool).await?;
+        Ok(id)
+    } else {
+        info!("No matching config found, inserting new config");
+        insert_config_with_pool_and_mode(config, pool, mode).await
+    }
+}
+
+pub(crate) async fn import_configs_with_pool_and_mode(
+    json: String, pool: &SqlitePool, mode: DatabaseMode,
+) -> Result<(), String> {
+    let configs = parse_import_configs(&json)?;
+
+    let existing_configs = read_configs_with_pool(pool).await?;
+
+    for (config, existing) in assign_identity_matches(&existing_configs, configs) {
+        merge_config_with_existing_and_mode(config, existing, pool, mode)
+            .await
+            .map_err(|e| format!("Failed to merge config: {e}"))?;
+    }
+
+    if let Err(e) = migrate_configs(Some(pool)).await {
+        return Err(format!("Error migrating configs: {e}"));
+    }
+
+    Ok(())
+}
+
+pub async fn import_configs(json: String) -> Result<(), String> {
+    let pool = get_db_pool().await.map_err(|e| e.to_string())?;
+    import_configs_with_pool(json, &pool).await
+}
+
+pub async fn delete_config_with_mode(id: i64, mode: DatabaseMode) -> Result<(), String> {
+    let context = DatabaseManager::get_context(mode).await?;
+    delete_config_with_pool(id, &context.pool)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub async fn delete_configs_with_mode(ids: Vec<i64>, mode: DatabaseMode) -> Result<(), String> {
+    let context = DatabaseManager::get_context(mode).await?;
+    delete_configs_with_pool(ids, &context.pool)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub async fn delete_all_configs_with_mode(mode: DatabaseMode) -> Result<(), String> {
+    let context = DatabaseManager::get_context(mode).await?;
+    delete_all_configs_with_pool(&context.pool)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub async fn insert_config_with_mode(config: Config, mode: DatabaseMode) -> Result<i64, String> {
+    let context = DatabaseManager::get_context(mode).await?;
+    insert_config_with_pool_and_mode(config, &context.pool, mode).await
+}
+
+pub async fn upsert_configs_with_mode(
+    configs: Vec<Config>, mode: DatabaseMode,
+) -> Result<Vec<i64>, String> {
+    let context = DatabaseManager::get_context(mode).await?;
+    upsert_configs_with_pool_and_mode(configs, &context.pool, mode).await
+}
+
+pub async fn upsert_configs_with_pool_and_mode(
+    configs: Vec<Config>, pool: &SqlitePool, mode: DatabaseMode,
+) -> Result<Vec<i64>, String> {
+    let existing_configs = read_configs_with_pool(pool).await?;
+    let configs = dedup_configs(configs);
+    let matches = assign_identity_matches(&existing_configs, configs);
+
+    let mut ids = Vec::with_capacity(matches.len());
+    for (config, existing) in matches {
+        let id = merge_config_with_existing_and_mode(config, existing, pool, mode)
+            .await
+            .map_err(|e| format!("Failed to merge config: {e}"))?;
+        ids.push(id);
+    }
+
+    if let Err(e) = migrate_configs(Some(pool)).await {
+        return Err(format!("Error migrating configs: {e}"));
+    }
+
+    Ok(ids)
+}
+
+/// Saves only the configs that match no saved one and returns their new ids.
+///
+/// Saved configs are left as they are, unlike an upsert: a running forward
+/// keeps the fields it wrote at start, such as an allocated loopback address
+/// that its stop still has to release.
+pub async fn insert_new_configs_with_mode(
+    configs: Vec<Config>, mode: DatabaseMode,
+) -> Result<Vec<i64>, String> {
+    let context = DatabaseManager::get_context(mode).await?;
+    insert_new_configs_with_pool_and_mode(configs, &context.pool, mode).await
+}
+
+async fn insert_new_configs_with_pool_and_mode(
+    configs: Vec<Config>, pool: &SqlitePool, mode: DatabaseMode,
+) -> Result<Vec<i64>, String> {
+    let mut known = read_configs_with_pool(pool).await?;
+
+    let mut ids = Vec::new();
+    for mut config in configs {
+        if known
+            .iter()
+            .any(|existing| configs_match_identity(existing, &config))
+        {
+            continue;
+        }
+        let id = insert_config_with_pool_and_mode(config.clone(), pool, mode)
+            .await
+            .map_err(|e| format!("Failed to insert config: {e}"))?;
+        config.id = Some(id);
+        known.push(config);
+        ids.push(id);
+    }
+
+    if !ids.is_empty()
+        && let Err(e) = migrate_configs(Some(pool)).await
+    {
+        return Err(format!("Error migrating configs: {e}"));
+    }
+
+    Ok(ids)
+}
+
+pub async fn read_configs_with_mode(mode: DatabaseMode) -> Result<Vec<Config>, String> {
+    let context = DatabaseManager::get_context(mode).await?;
+    read_configs_with_pool(&context.pool).await
+}
+
+pub async fn get_config_with_mode(id: i64, mode: DatabaseMode) -> Result<Config, String> {
+    let context = DatabaseManager::get_context(mode).await?;
+    get_config_with_pool(id, &context.pool).await
+}
+
+pub async fn update_config_with_mode(config: Config, mode: DatabaseMode) -> Result<(), String> {
+    let context = DatabaseManager::get_context(mode).await?;
+    update_config_with_pool(config, &context.pool).await
+}
+
+/// Outcome of [`set_allocated_local_address`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocatedAddressWrite {
+    /// The address was written.
+    Written,
+    /// The configuration still exists but no longer asks for an allocated
+    /// address, or was edited to opt out concurrently with the write.
+    NotRequested,
+    /// The configuration row no longer exists.
+    RowMissing,
+}
+
+/// Records an auto-allocated loopback address without touching any other field.
+///
+/// The write is conditional on the stored configuration still asking for an
+/// allocated address: a read-modify-write of the whole record would lose an
+/// edit made while the allocation was in flight, and would overwrite an address
+/// the user chose manually in the meantime.
+pub async fn set_allocated_local_address(
+    id: i64, address: &str, mode: DatabaseMode,
+) -> Result<AllocatedAddressWrite, String> {
+    let context = DatabaseManager::get_context(mode).await?;
+    let mut conn = context.pool.acquire().await.map_err(|e| e.to_string())?;
+    let updated = sqlx::query(
+        "UPDATE configs
+         SET data = json_set(data, '$.local_address', ?1)
+         WHERE id = ?2
+           AND json_extract(data, '$.auto_loopback_address') IN (1, 'true')",
+    )
+    .bind(address)
+    .bind(id)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if updated.rows_affected() > 0 {
+        return Ok(AllocatedAddressWrite::Written);
+    }
+
+    let exists = sqlx::query("SELECT 1 FROM configs WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| e.to_string())?
+        .is_some();
+
+    Ok(if exists {
+        AllocatedAddressWrite::NotRequested
+    } else {
+        AllocatedAddressWrite::RowMissing
+    })
+}
+
+pub async fn export_configs_with_mode(mode: DatabaseMode) -> Result<String, String> {
+    let context = DatabaseManager::get_context(mode).await?;
+    export_configs_with_pool(&context.pool).await
+}
+
+pub async fn import_configs_with_mode(json: String, mode: DatabaseMode) -> Result<(), String> {
+    let context = DatabaseManager::get_context(mode).await?;
+    import_configs_with_pool_and_mode(json, &context.pool, mode).await
+}
+
+pub async fn get_configs_with_mode(mode: DatabaseMode) -> Result<Vec<Config>, String> {
+    read_configs_with_mode(mode).await
+}
+
+pub async fn clean_all_custom_hosts_entries_with_mode(mode: DatabaseMode) -> Result<(), String> {
+    let context = DatabaseManager::get_context(mode).await?;
+    clean_all_custom_hosts_entries_with_pool(&context.pool).await
+}
+
+fn pick_unused_local_port() -> Option<u16> {
+    use std::net::{
+        TcpListener,
+        UdpSocket,
+    };
+
+    for _ in 0..10 {
+        let Ok(tcp) = TcpListener::bind("127.0.0.1:0") else {
+            continue;
+        };
+        let Ok(addr) = tcp.local_addr() else {
+            continue;
+        };
+        let port = addr.port();
+        if UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return Some(port);
+        }
+    }
+    None
+}
+
+fn prepare_config(mut config: Config) -> Result<Config, String> {
+    config.tags = normalize_tags(std::mem::take(&mut config.tags))?;
+    validate_tags(&config.tags)?;
+
+    if let Some(ref mut alias) = config.alias {
+        *alias = alias.trim().to_string();
+    }
+    if let Some(ref mut kubeconfig) = config.kubeconfig {
+        *kubeconfig = kubeconfig.trim().to_string();
+    }
+
+    if config.local_port == Some(0) || config.local_port.is_none() {
+        match pick_unused_local_port() {
+            Some(port) => config.local_port = Some(port),
+            None => {
+                config.local_port = config.remote_port;
+                error!("Failed to find an unused port, using remote_port as local_port");
+            }
+        }
+    }
+
+    if config.alias.as_deref() == Some("") || config.alias.is_none() {
+        let workload_type = config.workload_type.clone().unwrap_or_default();
+        let alias = format!(
+            "{}-{}-{}",
+            workload_type,
+            config.protocol,
+            config.local_port.unwrap_or_default()
+        );
+        config.alias = Some(alias);
+    }
+
+    if config.kubeconfig.as_deref() == Some("") || config.kubeconfig.is_none() {
+        config.kubeconfig = Some("default".to_string());
+    }
+
+    if config.http_logs_enabled.is_none() {
+        config.http_logs_enabled = Some(false);
+    }
+    if config.http_logs_max_file_size.is_none() {
+        config.http_logs_max_file_size = Some(10 * 1024 * 1024); // 10MB
+    }
+    if config.http_logs_retention_days.is_none() {
+        config.http_logs_retention_days = Some(7);
+    }
+    if config.http_logs_auto_cleanup.is_none() {
+        config.http_logs_auto_cleanup = Some(true);
+    }
+
+    Ok(config)
+}
+
+async fn sync_http_logs_config_from_config(
+    config: &Config, config_id: i64, pool: &SqlitePool,
+) -> Result<(), String> {
+    use crate::models::http_logs_config_model::HttpLogsConfig;
+    use crate::utils::http_logs_config::update_http_logs_config_with_pool;
+
+    let http_config = HttpLogsConfig {
+        config_id,
+        enabled: config.http_logs_enabled.unwrap_or(false),
+        max_file_size: config.http_logs_max_file_size.unwrap_or(10 * 1024 * 1024),
+        retention_days: config.http_logs_retention_days.unwrap_or(7),
+        auto_cleanup: config.http_logs_auto_cleanup.unwrap_or(true),
+    };
+
+    update_http_logs_config_with_pool(&http_config, pool).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use lazy_static::lazy_static;
+    use serde_json::{
+        Value,
+        json,
+    };
+    use sqlx::SqlitePool;
+    use tokio::sync::Mutex;
+
+    use super::*;
+
+    lazy_static! {
+        static ref IO_TEST_MUTEX: Mutex<()> = Mutex::new(());
+    }
+
+    #[test]
+    fn test_prepare_config_trims_fields() {
+        let config = Config {
+            alias: Some("  alias  ".to_string()),
+            kubeconfig: Some("  kube  ".to_string()),
+            ..Config::default()
+        };
+        let prepared = prepare_config(config).unwrap();
+        assert_eq!(prepared.alias, Some("alias".to_string()));
+        assert_eq!(prepared.kubeconfig, Some("kube".to_string()));
+    }
+
+    #[test]
+    fn test_prepare_config_normalizes_tags() {
+        let config = Config {
+            tags: [(" Team ".to_string(), " core ".to_string())].into(),
+            ..Config::default()
+        };
+        let prepared = prepare_config(config).unwrap();
+        assert_eq!(prepared.tags.get("team").map(String::as_str), Some("core"));
+
+        let invalid = Config {
+            tags: [("bad key".to_string(), String::new())].into(),
+            ..Config::default()
+        };
+        assert!(prepare_config(invalid).is_err());
+    }
+
+    #[test]
+    fn test_prepare_config_sets_default_kubeconfig() {
+        let config_empty = Config {
+            kubeconfig: Some("".to_string()),
+            ..Config::default()
+        };
+        let prepared_empty = prepare_config(config_empty).unwrap();
+        assert_eq!(prepared_empty.kubeconfig, Some("default".to_string()));
+
+        let config_none = Config {
+            kubeconfig: None,
+            ..Config::default()
+        };
+        let prepared_none = prepare_config(config_none).unwrap();
+        assert_eq!(prepared_none.kubeconfig, Some("default".to_string()));
+    }
+
+    #[test]
+    fn test_prepare_config_sets_default_alias() {
+        let config_empty = Config {
+            alias: Some("".to_string()),
+            workload_type: Some("deployment".to_string()),
+            protocol: "TCP".to_string(),
+            local_port: Some(8080),
+            ..Config::default()
+        };
+        let prepared_empty = prepare_config(config_empty).unwrap();
+        assert_eq!(
+            prepared_empty.alias,
+            Some("deployment-TCP-8080".to_string())
+        );
+
+        let config_none = Config {
+            alias: None,
+            workload_type: Some("pod".to_string()),
+            protocol: "UDP".to_string(),
+            local_port: Some(9090),
+            ..Config::default()
+        };
+        let prepared_none = prepare_config(config_none).unwrap();
+        assert_eq!(prepared_none.alias, Some("pod-UDP-9090".to_string()));
+    }
+
+    #[test]
+    fn test_prepare_config_picks_local_port() {
+        let config0 = Config {
+            local_port: Some(0),
+            remote_port: Some(8000),
+            ..Config::default()
+        };
+        let prepared0 = prepare_config(config0).unwrap();
+        assert!(prepared0.local_port.is_some());
+        assert_ne!(prepared0.local_port, Some(0));
+
+        let config_none = Config {
+            local_port: None,
+            remote_port: Some(9000),
+            ..Config::default()
+        };
+        let prepared_none = prepare_config(config_none).unwrap();
+        assert!(prepared_none.local_port.is_some());
+    }
+
+    async fn setup_test_db() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("Failed to connect to in-memory database");
+        create_db_table(&pool)
+            .await
+            .expect("Failed to create tables");
+        crate::migration::migrate_configs(Some(&pool))
+            .await
+            .expect("Failed to run migrations");
+        pool
+    }
+
+    #[tokio::test]
+    async fn test_insert_and_get_config() {
+        let pool = setup_test_db().await;
+        let config = Config {
+            service: Some("test-service".to_string()),
+            ..Config::default()
+        };
+
+        insert_config_with_pool(config.clone(), &pool)
+            .await
+            .unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs.len(), 1);
+        let retrieved_config = configs.first().unwrap();
+        assert!(retrieved_config.id.is_some());
+        let id = retrieved_config.id.unwrap();
+
+        let fetched_config = get_config_with_pool(id, &pool).await.unwrap();
+        assert_eq!(fetched_config.id, Some(id));
+        assert_eq!(fetched_config.service, Some("test-service".to_string()));
+        assert_eq!(fetched_config.namespace, config.namespace);
+        assert!(fetched_config.local_port.is_some());
+        assert_ne!(
+            fetched_config.local_port,
+            Some(0),
+            "Local port should have been assigned by prepare_config"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_multiple_configs() {
+        let pool = setup_test_db().await;
+        let config1 = Config {
+            service: Some("service1".to_string()),
+            ..Config::default()
+        };
+        let config2 = Config {
+            service: Some("service2".to_string()),
+            ..Config::default()
+        };
+
+        insert_config_with_pool(config1, &pool).await.unwrap();
+        insert_config_with_pool(config2, &pool).await.unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs.len(), 2);
+        assert!(
+            configs
+                .iter()
+                .any(|c| c.service == Some("service1".to_string()))
+        );
+        assert!(
+            configs
+                .iter()
+                .any(|c| c.service == Some("service2".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_config_not_found() {
+        let pool = setup_test_db().await;
+        let result = get_config_with_pool(999, &pool).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No config found with id: 999"));
+    }
+
+    #[tokio::test]
+    async fn test_update_config() {
+        let pool = setup_test_db().await;
+        let config = Config {
+            service: Some("initial-service".to_string()),
+            ..Config::default()
+        };
+        insert_config_with_pool(config.clone(), &pool)
+            .await
+            .unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        let mut retrieved_config = configs.first().cloned().unwrap();
+        let id = retrieved_config.id.unwrap();
+
+        retrieved_config.service = Some("updated-service".to_string());
+        update_config_with_pool(retrieved_config.clone(), &pool)
+            .await
+            .unwrap();
+
+        let updated_config = get_config_with_pool(id, &pool).await.unwrap();
+        assert_eq!(updated_config.id, Some(id));
+        assert_eq!(updated_config.service, Some("updated-service".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_delete_config() {
+        let pool = setup_test_db().await;
+        let config1 = Config {
+            service: Some("service1".to_string()),
+            ..Config::default()
+        };
+        let config2 = Config {
+            service: Some("service2".to_string()),
+            ..Config::default()
+        };
+        insert_config_with_pool(config1.clone(), &pool)
+            .await
+            .unwrap();
+        insert_config_with_pool(config2.clone(), &pool)
+            .await
+            .unwrap();
+
+        let configs_before = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs_before.len(), 2);
+        let id_to_delete = configs_before
+            .iter()
+            .find(|c| c.service == Some("service1".to_string()))
+            .unwrap()
+            .id
+            .unwrap();
+
+        delete_config_with_pool(id_to_delete, &pool).await.unwrap();
+
+        let configs_after = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs_after.len(), 1);
+        assert_eq!(configs_after[0].service, Some("service2".to_string()));
+
+        let result = get_config_with_pool(id_to_delete, &pool).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_delete_configs() {
+        let pool = setup_test_db().await;
+        let config1 = Config {
+            service: Some("service1".to_string()),
+            ..Config::default()
+        };
+        let config2 = Config {
+            service: Some("service2".to_string()),
+            ..Config::default()
+        };
+        let config3 = Config {
+            service: Some("service3".to_string()),
+            ..Config::default()
+        };
+        insert_config_with_pool(config1, &pool).await.unwrap();
+        insert_config_with_pool(config2, &pool).await.unwrap();
+        insert_config_with_pool(config3, &pool).await.unwrap();
+
+        let configs_before = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs_before.len(), 3);
+        let ids_to_delete: Vec<i64> = configs_before
+            .iter()
+            .filter(|c| {
+                c.service == Some("service1".to_string())
+                    || c.service == Some("service3".to_string())
+            })
+            .map(|c| c.id.unwrap())
+            .collect();
+
+        delete_configs_with_pool(ids_to_delete, &pool)
+            .await
+            .unwrap();
+
+        let configs_after = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs_after.len(), 1);
+        assert_eq!(configs_after[0].service, Some("service2".to_string()));
+    }
+
+    async fn add_shortcut(pool: &SqlitePool, name: &str, config_ids: &[i64]) -> i64 {
+        sqlx::query(
+            "INSERT INTO shortcuts (name, shortcut_key, action_type, action_data)
+             VALUES (?1, 'Ctrl+Shift+F1', 'start_port_forward', ?2)",
+        )
+        .bind(name)
+        .bind(json!({ "config_ids": config_ids }).to_string())
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn shortcut_targets(pool: &SqlitePool, id: i64) -> Option<serde_json::Value> {
+        sqlx::query_scalar::<_, String>("SELECT action_data FROM shortcuts WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+            .map(|data| {
+                serde_json::from_str::<serde_json::Value>(&data).unwrap()["config_ids"].clone()
+            })
+    }
+
+    #[tokio::test]
+    async fn deleted_configs_leave_shortcuts_and_reused_ids_stay_untargeted() {
+        let pool = setup_test_db().await;
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            ids.push(
+                insert_config_with_pool(Config::default(), &pool)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let shared = add_shortcut(&pool, "shared", &ids).await;
+        let first = add_shortcut(&pool, "first", &ids[..1]).await;
+        let last = add_shortcut(&pool, "last", &ids[2..]).await;
+
+        delete_config_with_pool(ids[0], &pool).await.unwrap();
+        assert_eq!(
+            shortcut_targets(&pool, shared).await,
+            Some(json!([ids[1], ids[2]]))
+        );
+        assert_eq!(shortcut_targets(&pool, first).await, None);
+
+        delete_configs_with_pool(vec![ids[2]], &pool).await.unwrap();
+        assert_eq!(shortcut_targets(&pool, shared).await, Some(json!([ids[1]])));
+        assert_eq!(shortcut_targets(&pool, last).await, None);
+
+        let reused = insert_config_with_pool(Config::default(), &pool)
+            .await
+            .unwrap();
+        assert_eq!(reused, ids[2]);
+        assert_eq!(shortcut_targets(&pool, shared).await, Some(json!([ids[1]])));
+    }
+
+    #[tokio::test]
+    async fn test_delete_all_configs() {
+        let pool = setup_test_db().await;
+        insert_config_with_pool(Config::default(), &pool)
+            .await
+            .unwrap();
+        insert_config_with_pool(Config::default(), &pool)
+            .await
+            .unwrap();
+
+        assert_eq!(read_configs_with_pool(&pool).await.unwrap().len(), 2);
+
+        delete_all_configs_with_pool(&pool).await.unwrap();
+
+        assert_eq!(read_configs_with_pool(&pool).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn export_keeps_services_and_namespaces_named_like_defaults() {
+        let pool = setup_test_db().await;
+        let base = Config {
+            local_port: Some(18080),
+            remote_port: Some(80),
+            context: Some("dev".to_string()),
+            workload_type: Some("service".to_string()),
+            protocol: "tcp".to_string(),
+            ..Config::default()
+        };
+        for (alias, service, namespace) in [
+            ("svc", "default-service", "prod"),
+            ("ns", "web", "default-namespace"),
+        ] {
+            let config = Config {
+                alias: Some(alias.to_string()),
+                service: Some(service.to_string()),
+                namespace: namespace.to_string(),
+                ..base.clone()
+            };
+            insert_config_with_pool(config, &pool).await.unwrap();
+        }
+
+        let exported = export_configs_with_pool(&pool).await.unwrap();
+        let imported = parse_import_configs(&exported).unwrap();
+
+        let names: Vec<_> = imported
+            .iter()
+            .map(|c| (c.service.as_deref(), c.namespace.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                (Some("default-service"), "prod"),
+                (Some("web"), "default-namespace")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn pod_forward_keeps_its_domain_alias_after_export_and_import() {
+        let pool = setup_test_db().await;
+        let saved = Config {
+            service: Some(String::new()),
+            namespace: "db".to_string(),
+            context: Some("kind-dev".to_string()),
+            workload_type: Some("pod".to_string()),
+            target: Some("app=postgres".to_string()),
+            alias: Some("postgres.local".to_string()),
+            domain_enabled: Some(true),
+            protocol: "tcp".to_string(),
+            local_port: Some(5432),
+            remote_port: Some(5432),
+            ..Config::default()
+        };
+        insert_config_with_pool(saved, &pool).await.unwrap();
+
+        let exported = export_configs_with_pool(&pool).await.unwrap();
+        let imported = parse_import_configs(&exported).unwrap();
+
+        assert_eq!(imported[0].service.as_deref(), Some(""));
+        assert_eq!(imported[0].alias.as_deref(), Some("postgres.local"));
+        assert_eq!(imported[0].domain_enabled, Some(true));
+    }
+
+    #[tokio::test]
+    async fn export_import_keeps_http_log_settings_with_logging_off() {
+        let pool = setup_test_db().await;
+        let config = Config {
+            alias: Some("web".to_string()),
+            service: Some("web".to_string()),
+            namespace: "default".to_string(),
+            context: Some("ctx".to_string()),
+            workload_type: Some("service".to_string()),
+            protocol: "tcp".to_string(),
+            local_port: Some(18080),
+            remote_port: Some(80),
+            http_logs_enabled: Some(false),
+            http_logs_max_file_size: Some(5 * 1024 * 1024),
+            http_logs_retention_days: Some(30),
+            http_logs_auto_cleanup: Some(false),
+            ..Config::default()
+        };
+        insert_config_with_pool(config, &pool).await.unwrap();
+
+        let exported = export_configs_with_pool(&pool).await.unwrap();
+        import_configs_with_pool(exported, &pool).await.unwrap();
+
+        let saved = read_configs_with_pool(&pool).await.unwrap().remove(0);
+        assert_eq!(
+            (
+                saved.http_logs_enabled,
+                saved.http_logs_max_file_size,
+                saved.http_logs_retention_days,
+                saved.http_logs_auto_cleanup,
+            ),
+            (Some(false), Some(5 * 1024 * 1024), Some(30), Some(false))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_configs_refactored() {
+        let pool = setup_test_db().await;
+        let config1 = Config {
+            service: Some("export-service1".to_string()),
+            namespace: "default-namespace".to_string(),
+            local_port: Some(8080),
+            id: None,
+            ..Config::default()
+        };
+
+        let config2 = Config {
+            service: Some("export-service2".to_string()),
+            namespace: "custom-ns".to_string(),
+            alias: Some("".to_string()),
+            id: None,
+            ..Config::default()
+        };
+
+        insert_config_with_pool(config1.clone(), &pool)
+            .await
+            .unwrap();
+        insert_config_with_pool(config2.clone(), &pool)
+            .await
+            .unwrap();
+
+        let exported_json = export_configs_with_pool(&pool).await.unwrap();
+        println!("Exported JSON: {exported_json}");
+
+        let exported_configs: Vec<BTreeMap<String, Value>> =
+            serde_json::from_str(&exported_json).expect("Failed to parse exported JSON");
+
+        assert_eq!(exported_configs.len(), 2);
+
+        let exported_c1 = exported_configs
+            .iter()
+            .find(|c| c.get("service").and_then(|v| v.as_str()) == Some("export-service1"))
+            .expect("Config 1 not found in export");
+        let exported_c2 = exported_configs
+            .iter()
+            .find(|c| c.get("service").and_then(|v| v.as_str()) == Some("export-service2"))
+            .expect("Config 2 not found in export");
+
+        assert_eq!(exported_c1.get("service"), Some(&json!("export-service1")));
+        assert_eq!(exported_c1.get("local_port"), Some(&json!(8080)));
+        assert_eq!(
+            exported_c1.get("namespace"),
+            Some(&json!("default-namespace"))
+        );
+        assert!(exported_c1.get("id").is_none(), "ID should not be present");
+
+        assert_eq!(exported_c2.get("service"), Some(&json!("export-service2")));
+        assert_eq!(exported_c2.get("namespace"), Some(&json!("custom-ns")));
+
+        assert!(
+            exported_c2.get("alias").is_some(),
+            "Generated alias should be present"
+        );
+        let alias_from_json = exported_c2
+            .get("alias")
+            .unwrap()
+            .as_str()
+            .expect("Alias should be a string");
+        assert_ne!(alias_from_json, "", "Generated alias should not be blank");
+        assert_ne!(
+            alias_from_json,
+            Config::default().alias.unwrap(),
+            "Generated alias should differ from default"
+        );
+
+        assert!(exported_c2.get("id").is_none(), "ID should not be present");
+    }
+
+    #[tokio::test]
+    async fn test_import_configs_single() {
+        let pool = setup_test_db().await;
+        let config_json = json!({
+            "service": "imported-service",
+            "namespace": "import-ns",
+            "local_port": 5000,
+            "workload_type": "service",
+            "protocol": "tcp",
+            "context": "test-context"
+        })
+        .to_string();
+
+        import_configs_with_pool(config_json, &pool).await.unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs.len(), 1);
+        let imported = &configs[0];
+        assert_eq!(imported.service, Some("imported-service".to_string()));
+        assert_eq!(imported.namespace, "import-ns".to_string());
+        assert_eq!(imported.local_port, Some(5000));
+        assert!(imported.alias.is_some());
+        assert_ne!(imported.alias.as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn test_import_configs_multiple() {
+        let pool = setup_test_db().await;
+        let configs_json = json!([
+            {
+                "service": "imported-service1",
+                "workload_type": "service",
+                "protocol": "tcp",
+                "context": "test-context",
+                "namespace": "import-ns1",
+                "local_port": 5001
+            },
+            {
+                "service": "imported-service2",
+                "workload_type": "service",
+                "protocol": "tcp",
+                "context": "test-context",
+                "namespace": "import-ns2",
+                "local_port": 5002
+            }
+        ])
+        .to_string();
+
+        import_configs_with_pool(configs_json, &pool).await.unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs.len(), 2);
+        assert!(
+            configs
+                .iter()
+                .any(|c| c.service == Some("imported-service1".to_string()))
+        );
+        assert!(
+            configs
+                .iter()
+                .any(|c| c.service == Some("imported-service2".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_import_configs_invalid_json() {
+        let pool = setup_test_db().await;
+        let invalid_json = "{\"service\": \"bad json\",";
+        let result = import_configs_with_pool(invalid_json.to_string(), &pool).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Failed to parse config"));
+    }
+
+    #[tokio::test]
+    async fn test_import_rejects_config_without_supported_protocol() {
+        let pool = setup_test_db().await;
+        let base = json!({"service": "a", "namespace": "n", "workload_type": "service",
+            "context": "ctx", "remote_port": 80, "local_port": 8080});
+
+        for protocol in [None, Some(""), Some("TCP"), Some("http"), Some("protocol")] {
+            let mut config = base.clone();
+            if let Some(protocol) = protocol {
+                config["protocol"] = json!(protocol);
+            }
+
+            let error = import_configs_with_pool(config.to_string(), &pool)
+                .await
+                .unwrap_err();
+
+            assert!(error.contains("Protocol"), "{protocol:?}: {error}");
+            assert!(
+                read_configs_with_pool(&pool).await.unwrap().is_empty(),
+                "{protocol:?}"
+            );
+        }
+
+        for protocol in ["tcp", "udp"] {
+            let mut config = base.clone();
+            config["protocol"] = json!(protocol);
+            import_configs_with_pool(config.to_string(), &pool)
+                .await
+                .unwrap();
+        }
+        let saved: Vec<String> = read_configs_with_pool(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.protocol)
+            .collect();
+        assert_eq!(saved, ["tcp", "udp"]);
+    }
+
+    #[tokio::test]
+    async fn test_import_configs_same_identity_twice_keeps_last() {
+        let pool = setup_test_db().await;
+        let configs_json = json!([
+            {
+                "service": "shared-service",
+                "alias": "from-first-file",
+                "workload_type": "service",
+                "protocol": "tcp",
+                "context": "test-context",
+                "namespace": "default",
+                "local_port": 5001,
+                "remote_port": 80
+            },
+            {
+                "service": "shared-service",
+                "alias": "from-second-file",
+                "workload_type": "service",
+                "protocol": "tcp",
+                "context": "test-context",
+                "namespace": "default",
+                "local_port": 5001,
+                "remote_port": 80
+            }
+        ])
+        .to_string();
+
+        import_configs_with_pool(configs_json.clone(), &pool)
+            .await
+            .unwrap();
+        import_configs_with_pool(configs_json, &pool).await.unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].alias.as_deref(), Some("from-second-file"));
+    }
+
+    fn web_port(alias: &str, remote_port: u16) -> Value {
+        json!({
+            "alias": alias,
+            "service": "web",
+            "workload_type": "service",
+            "protocol": "tcp",
+            "context": "kind-dev",
+            "namespace": "shop",
+            "remote_port": remote_port
+        })
+    }
+
+    #[tokio::test]
+    async fn test_import_new_port_for_saved_service_keeps_saved_port() {
+        let pool = setup_test_db().await;
+        let first = json!([web_port("web-http", 80)]).to_string();
+        let second = json!([web_port("web-http", 80), web_port("web-https", 443)]).to_string();
+
+        import_configs_with_pool(first, &pool).await.unwrap();
+        let saved_port = read_configs_with_pool(&pool).await.unwrap()[0].local_port;
+        import_configs_with_pool(second, &pool).await.unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        let rows: Vec<_> = configs
+            .iter()
+            .map(|c| (c.alias.as_deref(), c.remote_port))
+            .collect();
+        assert_eq!(
+            rows,
+            [(Some("web-http"), Some(80)), (Some("web-https"), Some(443))]
+        );
+        assert_eq!(configs[0].local_port, saved_port);
+    }
+
+    #[tokio::test]
+    async fn test_upsert_new_port_for_saved_service_keeps_saved_port() {
+        let pool = setup_test_db().await;
+        let parse = |value: Value| parse_import_configs(&value.to_string()).unwrap();
+
+        let first = upsert_configs_with_pool_and_mode(
+            parse(json!([web_port("web-http", 80)])),
+            &pool,
+            DatabaseMode::File,
+        )
+        .await
+        .unwrap();
+        let second = upsert_configs_with_pool_and_mode(
+            parse(json!([
+                web_port("web-https", 443),
+                web_port("web-http", 80)
+            ])),
+            &pool,
+            DatabaseMode::File,
+        )
+        .await
+        .unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        let rows: Vec<_> = configs
+            .iter()
+            .map(|c| (c.id, c.alias.as_deref(), c.remote_port))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (Some(first[0]), Some("web-http"), Some(80)),
+                (Some(second[0]), Some("web-https"), Some(443))
+            ]
+        );
+        assert_eq!(second[1], first[0]);
+    }
+
+    #[tokio::test]
+    async fn test_upsert_repeated_entry_saves_one_row() {
+        let pool = setup_test_db().await;
+        let mut entry = Config {
+            service: Some("web".to_string()),
+            alias: Some("web".to_string()),
+            context: Some("kind-dev".to_string()),
+            namespace: "shop".to_string(),
+            workload_type: Some("service".to_string()),
+            protocol: "tcp".to_string(),
+            local_port: Some(8080),
+            remote_port: Some(80),
+            ..Default::default()
+        };
+        insert_config_with_pool(entry.clone(), &pool).await.unwrap();
+        entry.alias = Some("web-renamed".to_string());
+
+        let ids = upsert_configs_with_pool_and_mode(
+            vec![entry.clone(), entry],
+            &pool,
+            DatabaseMode::File,
+        )
+        .await
+        .unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].alias.as_deref(), Some("web-renamed"));
+        assert_eq!(ids, [configs[0].id.unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn test_sync_entry_saved_on_two_local_ports_adds_no_row() {
+        let pool = setup_test_db().await;
+        for local_port in [8080, 9080] {
+            let mut entry = web_port("web-http", 80);
+            entry["local_port"] = json!(local_port);
+            import_configs_with_pool(json!([entry]).to_string(), &pool)
+                .await
+                .unwrap();
+        }
+        let file = json!([web_port("web-http", 80)]).to_string();
+
+        for _ in 0..3 {
+            let ids = upsert_configs_with_pool_and_mode(
+                parse_import_configs(&file).unwrap(),
+                &pool,
+                DatabaseMode::File,
+            )
+            .await
+            .unwrap();
+            assert!(ids.is_empty());
+            import_configs_with_pool(file.clone(), &pool).await.unwrap();
+        }
+
+        let local_ports: Vec<_> = read_configs_with_pool(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|c| c.local_port)
+            .collect();
+        assert_eq!(local_ports, [Some(8080), Some(9080)]);
+    }
+
+    #[tokio::test]
+    async fn test_import_multiple_configs_same_service_different_ports() {
+        let pool = setup_test_db().await;
+
+        let configs_json = json!([
+            {
+                "service": "multi-port-service",
+                "alias": "nomad",
+                "workload_type": "service",
+                "protocol": "tcp",
+                "context": "test-context",
+                "namespace": "default",
+                "local_port": 10148,
+                "remote_port": 4646
+            },
+            {
+                "service": "multi-port-service",
+                "alias": "consul",
+                "workload_type": "service",
+                "protocol": "tcp",
+                "context": "test-context",
+                "namespace": "default",
+                "local_port": 20148,
+                "remote_port": 8500
+            },
+            {
+                "service": "multi-port-service",
+                "alias": "postgres",
+                "workload_type": "service",
+                "protocol": "tcp",
+                "context": "test-context",
+                "namespace": "default",
+                "local_port": 30148,
+                "remote_port": 5432
+            }
+        ])
+        .to_string();
+
+        import_configs_with_pool(configs_json.clone(), &pool)
+            .await
+            .unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs.len(), 3);
+
+        assert!(
+            configs
+                .iter()
+                .any(|c| c.local_port == Some(10148) && c.remote_port == Some(4646))
+        );
+        assert!(
+            configs
+                .iter()
+                .any(|c| c.local_port == Some(20148) && c.remote_port == Some(8500))
+        );
+        assert!(
+            configs
+                .iter()
+                .any(|c| c.local_port == Some(30148) && c.remote_port == Some(5432))
+        );
+
+        import_configs_with_pool(configs_json, &pool).await.unwrap();
+
+        let configs_after = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs_after.len(), 3);
+        assert!(
+            configs_after
+                .iter()
+                .any(|c| c.local_port == Some(10148) && c.remote_port == Some(4646))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_import_keeps_pod_and_proxy_configs_with_different_ports() {
+        let pool = setup_test_db().await;
+        let configs_json = json!([
+            {"workload_type": "pod", "target": "app=demo", "protocol": "tcp",
+             "context": "ctx", "namespace": "default", "alias": "web",
+             "local_port": 18080, "remote_port": 80},
+            {"workload_type": "pod", "target": "app=demo", "protocol": "tcp",
+             "context": "ctx", "namespace": "default", "alias": "metrics",
+             "local_port": 19090, "remote_port": 9090},
+            {"workload_type": "proxy", "remote_address": "db.example.com", "protocol": "tcp",
+             "context": "ctx", "namespace": "default", "alias": "pg",
+             "local_port": 15432, "remote_port": 5432},
+            {"workload_type": "proxy", "remote_address": "db.example.com", "protocol": "tcp",
+             "context": "ctx", "namespace": "default", "alias": "redis",
+             "local_port": 16379, "remote_port": 6379}
+        ])
+        .to_string();
+
+        import_configs_with_pool(configs_json.clone(), &pool)
+            .await
+            .unwrap();
+        import_configs_with_pool(configs_json, &pool).await.unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        let mut aliases: Vec<_> = configs.iter().filter_map(|c| c.alias.clone()).collect();
+        aliases.sort();
+        assert_eq!(aliases, vec!["metrics", "pg", "redis", "web"]);
+    }
+
+    #[tokio::test]
+    async fn test_import_second_pod_port_keeps_saved_pod_config() {
+        let pool = setup_test_db().await;
+        let saved = json!({"workload_type": "pod", "target": "app=demo", "protocol": "tcp",
+            "context": "ctx", "namespace": "default", "alias": "web",
+            "local_port": 18080, "remote_port": 80})
+        .to_string();
+        let incoming = json!({"workload_type": "pod", "target": "app=demo", "protocol": "tcp",
+            "context": "ctx", "namespace": "default", "alias": "metrics",
+            "local_port": 19090, "remote_port": 9090})
+        .to_string();
+
+        import_configs_with_pool(saved, &pool).await.unwrap();
+        import_configs_with_pool(incoming, &pool).await.unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        let mut ports: Vec<_> = configs
+            .iter()
+            .map(|c| (c.alias.clone(), c.local_port, c.remote_port))
+            .collect();
+        ports.sort();
+        assert_eq!(
+            ports,
+            vec![
+                (Some("metrics".to_string()), Some(19090), Some(9090)),
+                (Some("web".to_string()), Some(18080), Some(80)),
+            ]
+        );
+    }
+
+    async fn pod_ports_after_import(saved: Value, incoming: Value) -> Vec<(String, Option<u16>)> {
+        let pool = setup_test_db().await;
+        import_configs_with_pool(saved.to_string(), &pool)
+            .await
+            .unwrap();
+        import_configs_with_pool(incoming.to_string(), &pool)
+            .await
+            .unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        let mut ports: Vec<_> = configs
+            .iter()
+            .map(|c| (c.alias.clone().unwrap_or_default(), c.remote_port))
+            .collect();
+        ports.sort();
+        ports
+    }
+
+    fn saved_web_and_metrics_pods() -> Value {
+        json!([
+            {"workload_type": "pod", "target": "app=demo", "protocol": "tcp",
+             "context": "ctx", "namespace": "default", "alias": "web",
+             "local_port": 18080, "remote_port": 80},
+            {"workload_type": "pod", "target": "app=demo", "protocol": "tcp",
+             "context": "ctx", "namespace": "default", "alias": "metrics",
+             "local_port": 19090, "remote_port": 9090}
+        ])
+    }
+
+    #[tokio::test]
+    async fn test_import_without_local_port_updates_pod_with_same_remote_port() {
+        let incoming = json!({"workload_type": "pod", "target": "app=demo", "protocol": "tcp",
+            "context": "ctx", "namespace": "default", "alias": "prometheus",
+            "remote_port": 9090});
+
+        assert_eq!(
+            pod_ports_after_import(saved_web_and_metrics_pods(), incoming).await,
+            vec![
+                ("prometheus".to_string(), Some(9090)),
+                ("web".to_string(), Some(80)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_import_without_local_ports_keeps_each_remote_port() {
+        let incoming = json!([
+            {"workload_type": "pod", "target": "app=demo", "protocol": "tcp",
+             "context": "ctx", "namespace": "default", "alias": "prometheus",
+             "remote_port": 9090},
+            {"workload_type": "pod", "target": "app=demo", "protocol": "tcp",
+             "context": "ctx", "namespace": "default", "alias": "admin",
+             "remote_port": 7070}
+        ]);
+
+        assert_eq!(
+            pod_ports_after_import(saved_web_and_metrics_pods(), incoming).await,
+            vec![
+                ("admin".to_string(), Some(7070)),
+                ("prometheus".to_string(), Some(9090)),
+                ("web".to_string(), Some(80)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reimporting_exported_expose_config_keeps_one_copy() {
+        let pool = setup_test_db().await;
+        let saved = json!({"workload_type": "expose", "exposure_type": "cluster",
+            "protocol": "tcp", "context": "ctx", "namespace": "default",
+            "alias": "app.example.test", "local_port": 3000});
+        import_configs_with_pool(saved.to_string(), &pool)
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            let exported = export_configs_with_pool(&pool).await.unwrap();
+            import_configs_with_pool(exported, &pool).await.unwrap();
+        }
+
+        let other_alias = json!({"workload_type": "expose", "exposure_type": "cluster",
+            "protocol": "tcp", "context": "ctx", "namespace": "default",
+            "alias": "api.example.test", "local_port": 3000});
+        import_configs_with_pool(other_alias.to_string(), &pool)
+            .await
+            .unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        let mut aliases: Vec<_> = configs.iter().filter_map(|c| c.alias.clone()).collect();
+        aliases.sort();
+        assert_eq!(aliases, vec!["api.example.test", "app.example.test"]);
+    }
+
+    #[tokio::test]
+    async fn test_reimporting_expose_config_with_padded_alias_and_zero_port_keeps_one_copy() {
+        let pool = setup_test_db().await;
+        let incoming = json!({"workload_type": "expose", "exposure_type": "cluster",
+            "protocol": "tcp", "context": "ctx", "namespace": "default",
+            "alias": " app.example.test ", "local_port": 0});
+
+        import_configs_with_pool(incoming.to_string(), &pool)
+            .await
+            .unwrap();
+        let first_port = read_configs_with_pool(&pool).await.unwrap()[0].local_port;
+
+        for _ in 0..2 {
+            import_configs_with_pool(incoming.to_string(), &pool)
+                .await
+                .unwrap();
+        }
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].alias.as_deref(), Some("app.example.test"));
+        assert_eq!(configs[0].local_port, first_port);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_cluster_expose_survives_export_and_reimport() {
+        let source = setup_test_db().await;
+        let tcp = json!({"workload_type": "expose", "exposure_type": "cluster",
+            "exposure_protocol": "tcp", "protocol": "tcp", "context": "ctx",
+            "namespace": "default", "alias": "db", "local_port": 5432});
+        let http = json!({"workload_type": "expose", "exposure_type": "cluster",
+            "exposure_protocol": "http", "protocol": "tcp", "context": "ctx",
+            "namespace": "default", "alias": "web", "local_port": 3000});
+        import_configs_with_pool(json!([tcp, http]).to_string(), &source)
+            .await
+            .unwrap();
+
+        let exported = export_configs_with_pool(&source).await.unwrap();
+        let target = setup_test_db().await;
+        import_configs_with_pool(exported, &target).await.unwrap();
+
+        let configs = read_configs_with_pool(&target).await.unwrap();
+        let protocol_of = |alias: &str| {
+            configs
+                .iter()
+                .find(|c| c.alias.as_deref() == Some(alias))
+                .unwrap()
+                .exposure_protocol
+                .clone()
+        };
+        assert_eq!(protocol_of("db").as_deref(), Some("tcp"));
+        assert_eq!(protocol_of("web"), None);
+    }
+
+    #[test]
+    fn test_import_rejects_tcp_on_a_public_expose_and_unknown_protocols() {
+        let expose = |exposure_type: &str, exposure_protocol: &str| -> Config {
+            serde_json::from_value(json!({"workload_type": "expose",
+                "exposure_type": exposure_type, "exposure_protocol": exposure_protocol,
+                "protocol": "tcp", "namespace": "default", "alias": "db", "local_port": 5432}))
+            .unwrap()
+        };
+
+        assert!(validate_imported_config(&expose("cluster", "tcp")).is_ok());
+        assert!(validate_imported_config(&expose("public", "http")).is_ok());
+        let public_tcp = validate_imported_config(&expose("public", "tcp")).unwrap_err();
+        assert!(
+            public_tcp.contains("Public exposes carry HTTP"),
+            "{public_tcp}"
+        );
+        let unknown = validate_imported_config(&expose("cluster", "udp")).unwrap_err();
+        assert!(unknown.contains("got 'udp'"), "{unknown}");
+    }
+
+    #[tokio::test]
+    async fn test_export_import_keeps_configs_that_differ_only_by_kubeconfig() {
+        let source = setup_test_db().await;
+        for kubeconfig in ["default", "/home/u/.kube/k3s-prod.yaml"] {
+            let config = Config {
+                service: Some("api".to_string()),
+                namespace: "default".to_string(),
+                context: Some("default".to_string()),
+                workload_type: Some("service".to_string()),
+                protocol: "tcp".to_string(),
+                local_port: Some(8080),
+                remote_port: Some(80),
+                kubeconfig: Some(kubeconfig.to_string()),
+                ..Config::default()
+            };
+            insert_config_with_pool(config, &source).await.unwrap();
+        }
+
+        let kubeconfigs = |configs: Vec<Config>| {
+            let mut kubeconfigs: Vec<_> = configs.into_iter().map(|c| c.kubeconfig).collect();
+            kubeconfigs.sort();
+            kubeconfigs
+        };
+        let expected = vec![
+            Some("/home/u/.kube/k3s-prod.yaml".to_string()),
+            Some("default".to_string()),
+        ];
+        assert_eq!(
+            kubeconfigs(read_configs_with_pool(&source).await.unwrap()),
+            expected
+        );
+
+        let exported = export_configs_with_pool(&source).await.unwrap();
+        import_configs_with_pool(exported.clone(), &source)
+            .await
+            .unwrap();
+        assert_eq!(
+            kubeconfigs(read_configs_with_pool(&source).await.unwrap()),
+            expected
+        );
+
+        let target = setup_test_db().await;
+        import_configs_with_pool(exported, &target).await.unwrap();
+        assert_eq!(
+            kubeconfigs(read_configs_with_pool(&target).await.unwrap()),
+            expected
+        );
+
+        let blank_kubeconfig = json!({"workload_type": "service", "service": "api",
+            "protocol": "tcp", "context": "default", "namespace": "default",
+            "local_port": 8080, "remote_port": 80, "kubeconfig": " "});
+        import_configs_with_pool(blank_kubeconfig.to_string(), &target)
+            .await
+            .unwrap();
+        assert_eq!(
+            kubeconfigs(read_configs_with_pool(&target).await.unwrap()),
+            expected
+        );
+    }
+
+    fn same_port_service(local_address: Option<&str>, alias: &str, domain: bool) -> Config {
+        Config {
+            service: Some("db".to_string()),
+            namespace: "ns".to_string(),
+            context: Some("ctx1".to_string()),
+            workload_type: Some("service".to_string()),
+            protocol: "tcp".to_string(),
+            local_port: Some(18080),
+            remote_port: Some(80),
+            local_address: local_address.map(str::to_string),
+            alias: Some(alias.to_string()),
+            domain_enabled: Some(domain),
+            ..Config::default()
+        }
+    }
+
+    async fn endpoints(pool: &SqlitePool) -> Vec<(Option<i64>, Option<String>, Option<String>)> {
+        read_configs_with_pool(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.id, c.local_address, c.alias))
+            .collect()
+    }
+
+    async fn assert_round_trip_keeps_both(pair: [Config; 2]) {
+        let source = setup_test_db().await;
+        for config in pair.clone() {
+            insert_config_with_pool(config, &source).await.unwrap();
+        }
+        let saved = endpoints(&source).await;
+        assert_eq!(saved.len(), 2);
+        let exported = export_configs_with_pool(&source).await.unwrap();
+
+        let target = setup_test_db().await;
+        import_configs_with_pool(exported.clone(), &target)
+            .await
+            .unwrap();
+        assert_eq!(endpoints(&target).await, saved);
+
+        import_configs_with_pool(exported.clone(), &source)
+            .await
+            .unwrap();
+        assert_eq!(endpoints(&source).await, saved);
+
+        let holds_second = setup_test_db().await;
+        let second_id = insert_config_with_pool(pair[1].clone(), &holds_second)
+            .await
+            .unwrap();
+        import_configs_with_pool(exported, &holds_second)
+            .await
+            .unwrap();
+        let rows = endpoints(&holds_second).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            (Some(second_id), saved[1].1.clone(), saved[1].2.clone())
+        );
+        assert_eq!((&rows[1].1, &rows[1].2), (&saved[0].1, &saved[0].2));
+    }
+
+    #[tokio::test]
+    async fn test_export_import_keeps_configs_that_differ_only_by_local_address() {
+        assert_round_trip_keeps_both([
+            same_port_service(Some("127.0.0.2"), "db", false),
+            same_port_service(Some("127.0.0.3"), "db", false),
+        ])
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_export_import_keeps_configs_that_differ_only_by_domain_alias() {
+        assert_round_trip_keeps_both([
+            same_port_service(Some("127.0.0.1"), "db-a.local", true),
+            same_port_service(Some("127.0.0.1"), "db-b.local", true),
+        ])
+        .await;
+    }
+
+    async fn import_lone(config: Config, pool: &SqlitePool) {
+        let json = serde_json::to_string(&[config]).unwrap();
+        import_configs_with_pool(json, pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_import_lone_entry_with_new_address_updates_saved_row() {
+        let pool = setup_test_db().await;
+        let id = insert_config_with_pool(same_port_service(Some("127.0.0.2"), "db", false), &pool)
+            .await
+            .unwrap();
+
+        import_lone(same_port_service(Some("127.0.0.3"), "db", false), &pool).await;
+
+        assert_eq!(
+            endpoints(&pool).await,
+            vec![(
+                Some(id),
+                Some("127.0.0.3".to_string()),
+                Some("db".to_string())
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_import_lone_entry_adds_row_when_saved_endpoints_tie() {
+        let pool = setup_test_db().await;
+        for address in ["127.0.0.2", "127.0.0.3"] {
+            insert_config_with_pool(same_port_service(Some(address), "db", false), &pool)
+                .await
+                .unwrap();
+        }
+        let saved = endpoints(&pool).await;
+
+        for _ in 0..2 {
+            import_lone(same_port_service(Some("127.0.0.4"), "db", false), &pool).await;
+            let rows = endpoints(&pool).await;
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[..2], saved[..]);
+            assert_eq!(rows[2].1.as_deref(), Some("127.0.0.4"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_clean_all_custom_hosts_entries() {
+        let _lock = IO_TEST_MUTEX.lock().await;
+        let pool = setup_test_db().await;
+
+        let config1 = Config {
+            service: Some("host-service1".to_string()),
+            id: Some(1),
+            ..Config::default()
+        };
+
+        let config2 = Config {
+            service: Some("host-service2".to_string()),
+            id: Some(2),
+            ..Config::default()
+        };
+
+        insert_config_with_pool(config1, &pool).await.unwrap();
+        insert_config_with_pool(config2, &pool).await.unwrap();
+
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        let temp_path = temp_file.path();
+
+        std::fs::write(temp_path, "# Test hosts file\n127.0.0.1 localhost\n").unwrap();
+
+        let result =
+            clean_all_custom_hosts_entries_with_pool_and_path(&pool, Some(temp_path)).await;
+        assert!(
+            result.is_ok(),
+            "clean_all_custom_hosts_entries failed: {:?}",
+            result.err()
+        );
+
+        let content = std::fs::read_to_string(temp_path).unwrap();
+        assert!(content.contains("localhost"));
+    }
+
+    #[tokio::test]
+    async fn test_get_configs() {
+        let pool = setup_test_db().await;
+
+        let config1 = Config {
+            service: Some("get-configs-test".to_string()),
+            ..Config::default()
+        };
+
+        insert_config_with_pool(config1, &pool).await.unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].service, Some("get-configs-test".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_delete_config_public() {
+        let pool = setup_test_db().await;
+
+        let config = Config {
+            service: Some("delete-test-public".to_string()),
+            ..Config::default()
+        };
+
+        insert_config_with_pool(config, &pool).await.unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs.len(), 1);
+        let id = configs[0].id.unwrap();
+
+        let result = delete_config_with_pool(id, &pool).await;
+        assert!(result.is_ok());
+
+        let configs_after = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs_after.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_configs_public() {
+        let pool = setup_test_db().await;
+
+        let config1 = Config {
+            service: Some("delete-multi-1".to_string()),
+            ..Config::default()
+        };
+
+        let config2 = Config {
+            service: Some("delete-multi-2".to_string()),
+            ..Config::default()
+        };
+
+        insert_config_with_pool(config1, &pool).await.unwrap();
+        insert_config_with_pool(config2, &pool).await.unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs.len(), 2);
+        let ids: Vec<i64> = configs.iter().map(|c| c.id.unwrap()).collect();
+
+        let result = delete_configs_with_pool(ids, &pool).await;
+        assert!(result.is_ok());
+
+        let configs_after = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs_after.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_all_configs_public() {
+        let pool = setup_test_db().await;
+
+        let config1 = Config {
+            service: Some("delete-all-1".to_string()),
+            ..Config::default()
+        };
+
+        let config2 = Config {
+            service: Some("delete-all-2".to_string()),
+            ..Config::default()
+        };
+
+        insert_config_with_pool(config1, &pool).await.unwrap();
+        insert_config_with_pool(config2, &pool).await.unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs.len(), 2);
+        let result = delete_all_configs_with_pool(&pool).await;
+        assert!(result.is_ok());
+
+        let configs_after = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs_after.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_insert_config_public() {
+        let pool = setup_test_db().await;
+
+        let config = Config {
+            service: Some("insert-public-test".to_string()),
+            ..Config::default()
+        };
+
+        let result = insert_config_with_pool(config.clone(), &pool).await;
+        assert!(result.is_ok());
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].service, Some("insert-public-test".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_read_configs_public() {
+        let pool = setup_test_db().await;
+
+        let config = Config {
+            service: Some("read-public-test".to_string()),
+            ..Config::default()
+        };
+
+        insert_config_with_pool(config, &pool).await.unwrap();
+
+        let result = read_configs_with_pool(&pool).await;
+        assert!(result.is_ok());
+
+        let configs = result.unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].service, Some("read-public-test".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_config_public() {
+        let pool = setup_test_db().await;
+
+        let config = Config {
+            service: Some("get-single-test".to_string()),
+            ..Config::default()
+        };
+
+        insert_config_with_pool(config, &pool).await.unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        let id = configs[0].id.unwrap();
+
+        let result = get_config_with_pool(id, &pool).await;
+        assert!(result.is_ok());
+
+        let fetched_config = result.unwrap();
+        assert_eq!(fetched_config.service, Some("get-single-test".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_config_not_found_public() {
+        let pool = setup_test_db().await;
+
+        let result = get_config_with_pool(999, &pool).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No config found with id: 999"));
+    }
+
+    #[tokio::test]
+    async fn test_update_config_public() {
+        let pool = setup_test_db().await;
+
+        let config = Config {
+            service: Some("update-public-test".to_string()),
+            ..Config::default()
+        };
+
+        insert_config_with_pool(config, &pool).await.unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        let mut config_to_update = configs[0].clone();
+
+        config_to_update.service = Some("updated-service".to_string());
+
+        let result = update_config_with_pool(config_to_update, &pool).await;
+        assert!(result.is_ok());
+
+        let updated_configs = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(updated_configs.len(), 1);
+        assert_eq!(
+            updated_configs[0].service,
+            Some("updated-service".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_configs_public() {
+        let pool = setup_test_db().await;
+
+        let config = Config {
+            service: Some("export-public-test".to_string()),
+            namespace: "test-namespace".to_string(),
+            ..Config::default()
+        };
+
+        insert_config_with_pool(config, &pool).await.unwrap();
+
+        let result = export_configs_with_pool(&pool).await;
+        assert!(result.is_ok());
+
+        let exported_json = result.unwrap();
+        assert!(exported_json.contains("export-public-test"));
+        assert!(exported_json.contains("test-namespace"));
+    }
+
+    #[tokio::test]
+    async fn test_import_configs_public() {
+        let pool = setup_test_db().await;
+
+        let config_json = json!({
+            "service": "import-public-test",
+            "namespace": "import-namespace",
+            "local_port": 5000,
+            "workload_type": "service",
+            "protocol": "tcp",
+            "context": "test-context"
+        })
+        .to_string();
+
+        let result = import_configs_with_pool(config_json, &pool).await;
+        assert!(result.is_ok());
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].service, Some("import-public-test".to_string()));
+        assert_eq!(configs[0].namespace, "import-namespace");
+        assert_eq!(configs[0].local_port, Some(5000));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_config_port_fallback() {
+        let config = Config {
+            local_port: Some(0),
+            remote_port: Some(8080),
+            ..Config::default()
+        };
+
+        let prepared = prepare_config(config).unwrap();
+
+        assert!(prepared.local_port.is_some());
+
+        if prepared.local_port == Some(8080) {
+            assert_eq!(prepared.local_port, prepared.remote_port);
+        } else {
+            assert_ne!(prepared.local_port, Some(0));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_error_reading_configs() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+
+        let result = read_configs_with_pool(&pool).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_config_with_mode_memory() {
+        let _db = crate::test_utils::test_db().await;
+
+        let _ = delete_all_configs_with_mode(DatabaseMode::Memory).await;
+
+        let config = Config {
+            service: Some("memory-test".to_string()),
+            ..Config::default()
+        };
+
+        insert_config_with_mode(config.clone(), DatabaseMode::Memory)
+            .await
+            .unwrap();
+
+        let configs = read_configs_with_mode(DatabaseMode::Memory).await.unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].service, Some("memory-test".to_string()));
+
+        let config_id = configs[0].id.unwrap();
+        let retrieved_config = get_config_with_mode(config_id, DatabaseMode::Memory)
+            .await
+            .unwrap();
+        assert_eq!(retrieved_config.service, Some("memory-test".to_string()));
+
+        delete_config_with_mode(config_id, DatabaseMode::Memory)
+            .await
+            .unwrap();
+
+        let configs_after_delete = read_configs_with_mode(DatabaseMode::Memory).await.unwrap();
+        assert_eq!(configs_after_delete.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_config_operations_with_mode_memory() {
+        let _db = crate::test_utils::test_db().await;
+
+        let _ = delete_all_configs_with_mode(DatabaseMode::Memory).await;
+
+        let config1 = Config {
+            service: Some("memory-test-1".to_string()),
+            ..Config::default()
+        };
+        let config2 = Config {
+            service: Some("memory-test-2".to_string()),
+            ..Config::default()
+        };
+
+        insert_config_with_mode(config1, DatabaseMode::Memory)
+            .await
+            .unwrap();
+        insert_config_with_mode(config2, DatabaseMode::Memory)
+            .await
+            .unwrap();
+
+        let configs = read_configs_with_mode(DatabaseMode::Memory).await.unwrap();
+        assert_eq!(configs.len(), 2);
+
+        let exported_json = export_configs_with_mode(DatabaseMode::Memory)
+            .await
+            .unwrap();
+        assert!(exported_json.contains("memory-test-1"));
+        assert!(exported_json.contains("memory-test-2"));
+
+        delete_all_configs_with_mode(DatabaseMode::Memory)
+            .await
+            .unwrap();
+
+        let configs_after_delete = read_configs_with_mode(DatabaseMode::Memory).await.unwrap();
+        assert_eq!(configs_after_delete.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_upserting_config_update() {
+        let _db = crate::test_utils::test_db().await;
+
+        let _ = delete_all_configs_with_mode(DatabaseMode::Memory).await;
+
+        let config1 = Config {
+            service: Some("memory-test-1".to_string()),
+            ..Config::default()
+        };
+
+        insert_config_with_mode(config1, DatabaseMode::Memory)
+            .await
+            .unwrap();
+
+        let new_config = Config {
+            service: Some("memory-test-1".to_string()),
+            local_port: Some(9090),
+            ..Config::default()
+        };
+
+        upsert_configs_with_mode(vec![new_config], DatabaseMode::Memory)
+            .await
+            .unwrap();
+
+        let configs = read_configs_with_mode(DatabaseMode::Memory).await.unwrap();
+
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].service, Some("memory-test-1".to_string()));
+        assert_eq!(configs[0].local_port, Some(9090));
+    }
+
+    #[tokio::test]
+    async fn test_upserting_config_inserting() {
+        let _db = crate::test_utils::test_db().await;
+
+        let _ = delete_all_configs_with_mode(DatabaseMode::Memory).await;
+
+        let config1 = Config {
+            service: Some("insert-test-1".to_string()),
+            ..Config::default()
+        };
+
+        upsert_configs_with_mode(vec![config1], DatabaseMode::Memory)
+            .await
+            .unwrap();
+
+        let configs = read_configs_with_mode(DatabaseMode::Memory).await.unwrap();
+
+        assert_eq!(configs.len(), 1);
+
+        let config2 = Config {
+            service: Some("insert-test-2".to_string()),
+            ..Config::default()
+        };
+
+        upsert_configs_with_mode(vec![config2], DatabaseMode::Memory)
+            .await
+            .unwrap();
+
+        let configs = read_configs_with_mode(DatabaseMode::Memory).await.unwrap();
+
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].service, Some("insert-test-1".to_string()));
+        assert_eq!(configs[1].service, Some("insert-test-2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_upserting_config_different_namespace() {
+        let _db = crate::test_utils::test_db().await;
+
+        let _ = delete_all_configs_with_mode(DatabaseMode::Memory).await;
+
+        let config1 = Config {
+            service: Some("same-service-test-1".to_string()),
+            ..Config::default()
+        };
+
+        upsert_configs_with_mode(vec![config1], DatabaseMode::Memory)
+            .await
+            .unwrap();
+
+        let configs = read_configs_with_mode(DatabaseMode::Memory).await.unwrap();
+
+        assert_eq!(configs.len(), 1);
+
+        let config2 = Config {
+            service: Some("same-service-test-1".to_string()),
+            namespace: "different-namespace".to_string(),
+            ..Config::default()
+        };
+
+        upsert_configs_with_mode(vec![config2], DatabaseMode::Memory)
+            .await
+            .unwrap();
+
+        let configs = read_configs_with_mode(DatabaseMode::Memory).await.unwrap();
+
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].service, Some("same-service-test-1".to_string()));
+        assert_eq!(configs[1].service, Some("same-service-test-1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_kftui_incremental_import_multiple_ports() {
+        let _db = crate::test_utils::test_db().await;
+
+        let _ = delete_all_configs_with_mode(DatabaseMode::Memory).await;
+
+        let configs = vec![
+            Config {
+                service: Some("my-service".to_string()),
+                alias: Some("nomad".to_string()),
+                workload_type: Some("service".to_string()),
+                protocol: "tcp".to_string(),
+                context: Some("test-context".to_string()),
+                namespace: "default".to_string(),
+                local_port: Some(10148),
+                remote_port: Some(4646),
+                ..Config::default()
+            },
+            Config {
+                service: Some("my-service".to_string()),
+                alias: Some("consul".to_string()),
+                workload_type: Some("service".to_string()),
+                protocol: "tcp".to_string(),
+                context: Some("test-context".to_string()),
+                namespace: "default".to_string(),
+                local_port: Some(20148),
+                remote_port: Some(8500),
+                ..Config::default()
+            },
+            Config {
+                service: Some("my-service".to_string()),
+                alias: Some("postgres".to_string()),
+                workload_type: Some("service".to_string()),
+                protocol: "tcp".to_string(),
+                context: Some("test-context".to_string()),
+                namespace: "default".to_string(),
+                local_port: Some(30148),
+                remote_port: Some(5432),
+                ..Config::default()
+            },
+        ];
+
+        upsert_configs_with_mode(configs.clone(), DatabaseMode::Memory)
+            .await
+            .unwrap();
+
+        let configs_after_first_import =
+            read_configs_with_mode(DatabaseMode::Memory).await.unwrap();
+        assert_eq!(
+            configs_after_first_import.len(),
+            3,
+            "First import should create 3 configs"
+        );
+
+        let nomad_config = configs_after_first_import
+            .iter()
+            .find(|c| c.alias.as_deref() == Some("nomad"))
+            .expect("nomad config should exist");
+        assert_eq!(nomad_config.local_port, Some(10148));
+        assert_eq!(nomad_config.remote_port, Some(4646));
+        assert_eq!(nomad_config.service, Some("my-service".to_string()));
+
+        let consul_config = configs_after_first_import
+            .iter()
+            .find(|c| c.alias.as_deref() == Some("consul"))
+            .expect("consul config should exist");
+        assert_eq!(consul_config.local_port, Some(20148));
+        assert_eq!(consul_config.remote_port, Some(8500));
+        assert_eq!(consul_config.service, Some("my-service".to_string()));
+
+        let postgres_config = configs_after_first_import
+            .iter()
+            .find(|c| c.alias.as_deref() == Some("postgres"))
+            .expect("postgres config should exist");
+        assert_eq!(postgres_config.local_port, Some(30148));
+        assert_eq!(postgres_config.remote_port, Some(5432));
+        assert_eq!(postgres_config.service, Some("my-service".to_string()));
+
+        upsert_configs_with_mode(configs, DatabaseMode::Memory)
+            .await
+            .unwrap();
+
+        let configs_after_second_import =
+            read_configs_with_mode(DatabaseMode::Memory).await.unwrap();
+        assert_eq!(
+            configs_after_second_import.len(),
+            3,
+            "Second import should still have 3 configs, not more"
+        );
+
+        let nomad_config_after = configs_after_second_import
+            .iter()
+            .find(|c| c.alias.as_deref() == Some("nomad"))
+            .expect("nomad config should still exist after second import");
+        assert_eq!(
+            nomad_config_after.local_port,
+            Some(10148),
+            "nomad local_port should not be overridden"
+        );
+        assert_eq!(
+            nomad_config_after.remote_port,
+            Some(4646),
+            "nomad remote_port should not be overridden"
+        );
+        assert_eq!(
+            nomad_config_after.service,
+            Some("my-service".to_string()),
+            "nomad service should remain my-service"
+        );
+
+        let consul_config_after = configs_after_second_import
+            .iter()
+            .find(|c| c.alias.as_deref() == Some("consul"))
+            .expect("consul config should still exist after second import");
+        assert_eq!(
+            consul_config_after.local_port,
+            Some(20148),
+            "consul local_port should not be overridden"
+        );
+        assert_eq!(
+            consul_config_after.remote_port,
+            Some(8500),
+            "consul remote_port should not be overridden"
+        );
+        assert_eq!(
+            consul_config_after.service,
+            Some("my-service".to_string()),
+            "consul service should remain my-service"
+        );
+
+        let postgres_config_after = configs_after_second_import
+            .iter()
+            .find(|c| c.alias.as_deref() == Some("postgres"))
+            .expect("postgres config should still exist after second import");
+        assert_eq!(
+            postgres_config_after.local_port,
+            Some(30148),
+            "postgres local_port should not be overridden"
+        );
+        assert_eq!(
+            postgres_config_after.remote_port,
+            Some(5432),
+            "postgres remote_port should not be overridden"
+        );
+        assert_eq!(
+            postgres_config_after.service,
+            Some("my-service".to_string()),
+            "postgres service should remain my-service"
+        );
+
+        assert!(
+            configs_after_second_import
+                .iter()
+                .all(|c| c.service == Some("my-service".to_string())),
+            "All configs should have the same service name"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_new_configs_adds_unknown_services_once_and_leaves_saved_ones_alone() {
+        let pool = setup_test_db().await;
+        let discovered = |service: &str, local_port: u16| Config {
+            context: Some("ctx".to_string()),
+            namespace: "default".to_string(),
+            service: Some(service.to_string()),
+            alias: Some(service.to_string()),
+            local_port: Some(local_port),
+            remote_port: Some(80),
+            protocol: "tcp".to_string(),
+            workload_type: Some("service".to_string()),
+            ..Config::default()
+        };
+
+        let first = insert_new_configs_with_pool_and_mode(
+            vec![discovered("api", 18080)],
+            &pool,
+            DatabaseMode::File,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.len(), 1);
+
+        let mut running = get_config_with_pool(first[0], &pool).await.unwrap();
+        running.local_address = Some("127.0.0.5".to_string());
+        update_config_with_pool(running, &pool).await.unwrap();
+
+        let second = insert_new_configs_with_pool_and_mode(
+            vec![
+                discovered("api", 18080),
+                discovered("web", 18081),
+                discovered("web", 18081),
+            ],
+            &pool,
+            DatabaseMode::File,
+        )
+        .await
+        .unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(configs.len(), 2);
+        let api = configs
+            .iter()
+            .find(|c| c.service.as_deref() == Some("api"))
+            .unwrap();
+        let web = configs
+            .iter()
+            .find(|c| c.service.as_deref() == Some("web"))
+            .unwrap();
+        assert_eq!(second, vec![web.id.unwrap()]);
+        assert_eq!(api.id, Some(first[0]));
+        assert_eq!(api.local_address.as_deref(), Some("127.0.0.5"));
+
+        let third = insert_new_configs_with_pool_and_mode(
+            vec![discovered("api", 18080), discovered("web", 18081)],
+            &pool,
+            DatabaseMode::File,
+        )
+        .await
+        .unwrap();
+        assert!(third.is_empty());
+        assert_eq!(read_configs_with_pool(&pool).await.unwrap().len(), 2);
+    }
+}

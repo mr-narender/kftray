@@ -1,0 +1,410 @@
+use std::str::FromStr;
+
+use clap::Parser;
+use kftray_commons::utils::config_view::{
+    Condition,
+    ConfigView,
+    Field,
+};
+use log::LevelFilter;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupBy(pub Option<Field>);
+
+impl FromStr for GroupBy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "none" => Ok(GroupBy(None)),
+            field => field.parse().map(|field| GroupBy(Some(field))),
+        }
+    }
+}
+
+#[derive(Parser, Clone)]
+#[command(name = "kftui")]
+#[command(about = "KFtray TUI - Manage kubectl port forward configurations")]
+#[command(version)]
+pub struct Cli {
+    #[arg(
+        short = 'c',
+        long,
+        help = "Path to config file (local JSON file or path within GitHub repo; comma-separate multiple paths when using --github-url)",
+        value_name = "PATH"
+    )]
+    pub configs_path: Option<String>,
+
+    #[arg(
+        short = 'g',
+        long,
+        help = "GitHub repository URL to import configs from",
+        value_name = "URL"
+    )]
+    pub github_url: Option<String>,
+
+    #[arg(
+        short = 's',
+        long,
+        help = "Save configs to SQLite database (requires a config source: --configs-path, --github-url, --json, --stdin, or --auto-discover)"
+    )]
+    pub save: bool,
+
+    #[arg(short = 'a', long, help = "Auto-start all port forward configurations")]
+    pub auto_start: bool,
+
+    #[arg(long, help = "Clear existing configurations before importing")]
+    pub flush: bool,
+
+    #[arg(
+        short = 'j',
+        long,
+        help = "Inline JSON configuration string",
+        value_name = "JSON"
+    )]
+    pub json: Option<String>,
+
+    #[arg(long, help = "Read JSON configuration from stdin")]
+    pub stdin: bool,
+
+    #[arg(long, help = "Run in non-interactive mode (don't show TUI)")]
+    pub non_interactive: bool,
+
+    #[arg(
+        long,
+        help = "Level for logs and for the messages kftui prints outside the TUI: error, warn, info, debug, trace or off (default: error when a command runs after --)",
+        value_name = "LEVEL"
+    )]
+    pub log_level: Option<LevelFilter>,
+
+    #[arg(
+        long,
+        help = "Save logs to file instead of showing in TUI logger widget"
+    )]
+    pub logs_to_file: bool,
+
+    #[arg(long, help = "Disable the automatic update check on TUI startup")]
+    pub no_update_check: bool,
+
+    #[arg(long, help = "Enable SSL/TLS for port forwarding (overrides settings)")]
+    pub ssl: bool,
+
+    #[arg(
+        long,
+        help = "Run annotation-based discovery to import configs from Kubernetes services"
+    )]
+    pub auto_discover: bool,
+
+    #[arg(
+        long,
+        help = "Kubernetes context to use for auto-discovery (requires --auto-discover)",
+        value_name = "NAME"
+    )]
+    pub context: Option<String>,
+
+    #[arg(
+        long,
+        help = "Path to a kubeconfig file or a folder of kubeconfig files for auto-discovery (default: system default)",
+        value_name = "PATH"
+    )]
+    pub kubeconfig: Option<String>,
+
+    #[arg(
+        long,
+        help = "Namespace to check for auto-discovery, without listing all namespaces (requires --auto-discover)",
+        value_name = "NAME"
+    )]
+    pub namespace: Option<String>,
+
+    #[arg(
+        long,
+        help = "Enable alias-as-domain for all discovered configs (requires --auto-discover)"
+    )]
+    pub alias_as_domain: bool,
+
+    #[arg(
+        long,
+        help = "Enable auto loopback address for all discovered configs (requires --auto-discover)"
+    )]
+    pub auto_loopback: bool,
+
+    #[arg(
+        long,
+        help = "Repeat auto-discovery every 30s while kftui runs: add newly annotated services, and start them with --auto-start (requires --auto-discover)"
+    )]
+    pub watch: bool,
+
+    #[arg(
+        long = "filter",
+        value_name = "COND",
+        help = "Filter configs, e.g. tag:env=dev or namespace=a,b (repeatable, AND-ed)"
+    )]
+    pub filters: Vec<Condition>,
+
+    #[arg(
+        long,
+        value_name = "FIELD",
+        help = "Group configs by context, namespace, kubeconfig, workload_type, protocol, tag:<key> or none"
+    )]
+    pub group_by: Option<GroupBy>,
+
+    #[arg(
+        last = true,
+        value_name = "COMMAND",
+        help = "Command to run once the port forwards start, given after --. kftui runs it without the TUI, stops the forwards when it exits and exits with its exit code. kftui writes only to stderr, and only errors unless --log-level is set (requires --auto-start)"
+    )]
+    pub command: Vec<String>,
+}
+
+impl Cli {
+    pub fn should_use_memory_mode(&self) -> bool {
+        self.has_config_source() && !self.save
+    }
+
+    pub fn is_github_import(&self) -> bool {
+        self.github_url.is_some()
+    }
+
+    pub fn has_config_source(&self) -> bool {
+        self.configs_path.is_some()
+            || self.github_url.is_some()
+            || self.json.is_some()
+            || self.stdin
+            || self.auto_discover
+    }
+
+    pub fn runs_command(&self) -> bool {
+        !self.command.is_empty()
+    }
+
+    /// A `--watch` run may start with no forward and wait for discovery to
+    /// add one. A command after `--` never runs without a forward.
+    pub fn may_start_empty(&self) -> bool {
+        self.watch && !self.runs_command()
+    }
+
+    /// `--log-level` when given. Otherwise warn, or error when a command
+    /// runs after `--`.
+    pub fn log_level(&self) -> LevelFilter {
+        self.level_or(LevelFilter::Warn)
+    }
+
+    /// Level for the messages kftui prints outside the TUI: `--log-level`
+    /// when given. Otherwise info, or error when a command runs after `--`,
+    /// so the command's output can go to a pipe or file without kftui's
+    /// status lines.
+    pub fn message_level(&self) -> LevelFilter {
+        self.level_or(LevelFilter::Info)
+    }
+
+    fn level_or(&self, default: LevelFilter) -> LevelFilter {
+        match self.log_level {
+            Some(level) => level,
+            None if self.runs_command() => LevelFilter::Error,
+            None => default,
+        }
+    }
+
+    pub fn filter_view(&self) -> ConfigView {
+        ConfigView {
+            group_by: None,
+            filters: self.filters.clone(),
+        }
+    }
+
+    pub fn apply_view_overrides(&self, mut view: ConfigView) -> ConfigView {
+        if !self.filters.is_empty() {
+            view.filters = self.filters.clone();
+        }
+        if let Some(GroupBy(group_by)) = &self.group_by {
+            view.group_by = group_by.clone();
+        }
+        view
+    }
+
+    /// Returns the view the TUI shows and, when `--group-by` replaced the
+    /// saved grouping for this session, the saved grouping to keep on save.
+    pub fn tui_view(&self, saved: ConfigView) -> (ConfigView, Option<Option<Field>>) {
+        let saved_group_by = self.group_by.as_ref().map(|_| saved.group_by.clone());
+        (self.apply_view_overrides(saved), saved_group_by)
+    }
+
+    pub fn get_config_path(&self) -> Option<&str> {
+        self.configs_path.as_deref()
+    }
+
+    pub fn get_github_url(&self) -> Option<&str> {
+        self.github_url.as_deref()
+    }
+
+    pub fn get_json(&self) -> Option<&str> {
+        self.json.as_deref()
+    }
+
+    pub fn get_configs_path_with_default(&self) -> String {
+        self.configs_path
+            .clone()
+            .unwrap_or_else(|| "config.json".to_string())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.save && !self.has_config_source() {
+            return Err(
+                "--save requires either --configs-path, --github-url, --json, --stdin, or --auto-discover"
+                    .to_string(),
+            );
+        }
+
+        if self.auto_discover && self.context.is_none() {
+            return Err("--auto-discover requires --context".to_string());
+        }
+
+        if self.alias_as_domain && !self.auto_discover {
+            return Err("--alias-as-domain requires --auto-discover".to_string());
+        }
+
+        if self.auto_loopback && !self.auto_discover {
+            return Err("--auto-loopback requires --auto-discover".to_string());
+        }
+
+        if self.kubeconfig.is_some() && !self.auto_discover {
+            return Err("--kubeconfig requires --auto-discover".to_string());
+        }
+
+        if self.namespace.is_some() && !self.auto_discover {
+            return Err("--namespace requires --auto-discover".to_string());
+        }
+
+        if self.context.is_some() && !self.auto_discover {
+            return Err("--context requires --auto-discover".to_string());
+        }
+
+        if self.watch && !self.auto_discover {
+            return Err("--watch requires --auto-discover".to_string());
+        }
+
+        if self.runs_command() && !self.auto_start {
+            return Err("a command after -- requires --auto-start".to_string());
+        }
+
+        if self.non_interactive {
+            if !self.auto_start && !self.save {
+                return Err(
+                    "--non-interactive requires either --auto-start or --save to perform an action"
+                        .to_string(),
+                );
+            }
+
+            if self.save && !self.auto_start && !self.has_config_source() {
+                return Err(
+                    "--non-interactive with --save requires a config source: --configs-path, --github-url, --json, --stdin, or --auto-discover"
+                        .to_string(),
+                );
+            }
+        }
+
+        self.validate_single_config_source()
+    }
+
+    fn validate_single_config_source(&self) -> Result<(), String> {
+        let sources = [
+            (
+                self.configs_path.is_some() && self.github_url.is_none(),
+                "--configs-path",
+            ),
+            (self.github_url.is_some(), "--github-url"),
+            (self.json.is_some(), "--json"),
+            (self.stdin, "--stdin"),
+            (self.auto_discover, "--auto-discover"),
+        ];
+
+        let active_sources: Vec<&str> = sources
+            .iter()
+            .filter_map(|(active, name)| if *active { Some(*name) } else { None })
+            .collect();
+
+        if self.github_url.is_some() && self.configs_path.is_none() {
+            return Err("--github-url requires --configs-path to specify the config file path within the repository".to_string());
+        }
+
+        if active_sources.len() > 1 {
+            return Err(format!(
+                "Only one config source can be specified. Found: {}",
+                active_sources.join(", ")
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use log::LevelFilter;
+
+    use super::Cli;
+
+    #[test]
+    fn parses_no_update_check_flag() {
+        let cli = Cli::try_parse_from(["kftui", "--no-update-check"]).unwrap();
+        assert!(cli.no_update_check);
+    }
+
+    #[test]
+    fn watch_requires_auto_discover() {
+        let cli = Cli::try_parse_from(["kftui", "--watch"]).unwrap();
+        assert_eq!(
+            cli.validate(),
+            Err("--watch requires --auto-discover".to_string())
+        );
+
+        let cli = Cli::try_parse_from(["kftui", "--auto-discover", "--context", "ctx", "--watch"])
+            .unwrap();
+        assert_eq!(cli.validate(), Ok(()));
+    }
+
+    #[test]
+    fn flags_after_double_dash_belong_to_the_command() {
+        let cli = Cli::try_parse_from([
+            "kftui", "--json", "[]", "--", "sh", "-c", "exit 3", "--save",
+        ])
+        .unwrap();
+        assert_eq!(cli.command, ["sh", "-c", "exit 3", "--save"]);
+        assert_eq!(cli.configs_path, None);
+        assert!(!cli.save);
+        assert_eq!(
+            cli.validate(),
+            Err("a command after -- requires --auto-start".to_string())
+        );
+
+        let cli =
+            Cli::try_parse_from(["kftui", "--json", "[]", "--auto-start", "--", "true"]).unwrap();
+        assert_eq!(cli.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_command_defaults_to_errors_only_unless_log_level_is_set() {
+        let cli = Cli::try_parse_from(["kftui", "--auto-start", "--", "true"]).unwrap();
+        assert_eq!(cli.log_level(), LevelFilter::Error);
+        assert_eq!(cli.message_level(), LevelFilter::Error);
+
+        let cli =
+            Cli::try_parse_from(["kftui", "--auto-start", "--log-level", "info", "--", "true"])
+                .unwrap();
+        assert_eq!(cli.log_level(), LevelFilter::Info);
+        assert_eq!(cli.message_level(), LevelFilter::Info);
+
+        let cli = Cli::try_parse_from(["kftui", "--auto-start", "--non-interactive"]).unwrap();
+        assert_eq!(cli.log_level(), LevelFilter::Warn);
+        assert_eq!(cli.message_level(), LevelFilter::Info);
+    }
+
+    #[test]
+    fn log_level_rejects_an_unknown_name_and_ignores_case() {
+        assert!(Cli::try_parse_from(["kftui", "--log-level", "warning"]).is_err());
+
+        let cli = Cli::try_parse_from(["kftui", "--log-level", "WARN"]).unwrap();
+        assert_eq!(cli.log_level(), LevelFilter::Warn);
+    }
+}

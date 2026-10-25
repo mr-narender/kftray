@@ -1,0 +1,63 @@
+name: Fuzz Testing
+
+on:
+  schedule:
+    - cron: "0 0 * * 0"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "fuzz/**"
+      - "crates/kftray-http-logs/**"
+      - "crates/kftray-commons/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_chunked_body
+          - fuzz_config_import
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust nightly
+        run: rustup toolchain install nightly --profile minimal --no-self-update
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-fuzz@0.13.2
+
+      - name: Cache cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: ${{ runner.os }}-cargo-fuzz-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fuzz-${{ matrix.target }}-
+            ${{ runner.os }}-cargo-fuzz-
+
+      - name: Run fuzzer
+        working-directory: fuzz
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$FUZZ_TARGET" -- -max_total_time=60

@@ -1,0 +1,139 @@
+import { useState } from 'react'
+
+import { Stack, Text } from '@chakra-ui/react'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+
+import { Button } from '@/components/ui/button'
+import {
+  AppDialog,
+  AppDialogBody,
+  AppDialogFooter,
+  DialogCancelButton,
+} from '@/components/ui/dialog'
+import { Switch } from '@/components/ui/switch'
+import {
+  type Consent,
+  performanceQuery,
+  setCrashReportsConsent,
+  setPerformanceConsent,
+  telemetryQuery,
+} from '@/lib/telemetry'
+
+type Choices = Record<Consent, boolean>
+
+const CONSENTS: Record<
+  Consent,
+  {
+    label: string
+    description: string
+    save: (enabled: boolean) => Promise<unknown>
+  }
+> = {
+  crashReports: {
+    label: 'Crash reports',
+    description: 'Send a report when kftray crashes.',
+    save: setCrashReportsConsent,
+  },
+  performance: {
+    label: 'Performance data',
+    description: 'Send how long port forwards take to start and stop.',
+    save: setPerformanceConsent,
+  },
+}
+
+const DECLINED: Choices = { crashReports: false, performance: false }
+// Crash reports start on, performance data starts off. Closing the dialog
+// saves what is shown; "No thanks" is the explicit decline.
+const DEFAULT: Choices = { crashReports: true, performance: false }
+
+// onDone runs after every answer, also after a failed save, so the caller
+// can stop asking for the rest of the session.
+export function TelemetryConsentModal({
+  consents,
+  onDone,
+}: {
+  consents: Consent[]
+  onDone: () => void
+}) {
+  const queryClient = useQueryClient()
+  const [choices, setChoices] = useState<Choices>(DEFAULT)
+  const choose = useMutation({
+    mutationFn: (answer: Choices) =>
+      Promise.all(
+        consents.map(consent => CONSENTS[consent].save(answer[consent])),
+      ),
+    onSettled: () => {
+      onDone()
+
+      return Promise.all(
+        [telemetryQuery, performanceQuery].map(query =>
+          queryClient.invalidateQueries({ queryKey: query.queryKey }),
+        ),
+      )
+    },
+    meta: { errorToast: { title: 'Failed to save the diagnostics setting' } },
+  })
+
+  return (
+    <AppDialog
+      data-testid='consent-dialog'
+      title='Help improve kftray'
+      onClose={() => choose.mutate(choices)}
+      closeDisabled={choose.isPending}
+      placement='center'
+      maxWidth='400px'
+    >
+      <AppDialogBody>
+        <Stack gap={3}>
+          <Text fontSize='xs' color='fg.muted'>
+            Automatic diagnostics exclude cluster, namespace and service names.
+            You can change these settings later.
+          </Text>
+          {consents.map(consent => (
+            <Stack key={consent} gap={1}>
+              <Switch
+                data-testid='consent-option'
+                data-id={consent}
+                size='sm'
+                colorPalette='blue'
+                checked={choices[consent]}
+                onCheckedChange={details =>
+                  setChoices(prev => ({ ...prev, [consent]: details.checked }))
+                }
+                disabled={choose.isPending}
+              >
+                <Text fontSize='xs' fontWeight='500'>
+                  {CONSENTS[consent].label}
+                </Text>
+              </Switch>
+              <Text fontSize='xs' color='fg.muted'>
+                {CONSENTS[consent].description}
+              </Text>
+            </Stack>
+          ))}
+        </Stack>
+      </AppDialogBody>
+      <AppDialogFooter>
+        <DialogCancelButton
+          data-testid='consent-decline'
+          label='No thanks'
+          onClick={() => choose.mutate(DECLINED)}
+          disabled={choose.isPending}
+        />
+        <Button
+          data-testid='consent-save'
+          size='xs'
+          height='28px'
+          bg='accent.solid'
+          color='fg'
+          _hover={{ bg: 'accent.solidHover' }}
+          _active={{ bg: 'accent.solidActive' }}
+          loading={choose.isPending}
+          onClick={() => choose.mutate(choices)}
+        >
+          Save
+        </Button>
+      </AppDialogFooter>
+    </AppDialog>
+  )
+}

@@ -1,0 +1,116 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "includes": ["frontend/**", "!frontend/dist"]
+  },
+  "formatter": {
+    "indentStyle": "space"
+  },
+  "javascript": {
+    "formatter": {
+      "semicolons": "asNeeded",
+      "quoteStyle": "single",
+      "jsxQuoteStyle": "single",
+      "arrowParentheses": "asNeeded"
+    }
+  },
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": {
+          "level": "on",
+          "options": {
+            "groups": [
+              "react",
+              [":PACKAGE:", "!@*/**"],
+              ":BLANK_LINE:",
+              ["@*/**", "!@/**"],
+              ":BLANK_LINE:",
+              ":ALIAS:",
+              ":BLANK_LINE:",
+              "../**",
+              ":BLANK_LINE:",
+              "./**",
+              ":BLANK_LINE:",
+              ":STYLE:"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "linter": {
+    "domains": {
+      "react": "recommended"
+    },
+    "rules": {
+      "preset": "recommended",
+      "a11y": {
+        "preset": "recommended"
+      },
+      "complexity": {
+        "noBannedTypes": "off",
+        "noImportantStyles": "off",
+        "useArrowFunction": "error",
+        "useMaxParams": {
+          "level": "error",
+          "options": { "max": 15 }
+        }
+      },
+      "correctness": {
+        "noUnusedFunctionParameters": "error",
+        "noUnusedImports": "error",
+        "noUnusedVariables": "error",
+        "useExhaustiveDependencies": "error"
+      },
+      "style": {
+        "noDefaultExport": "error",
+        "useBlockStatements": "error",
+        "useConst": "error"
+      },
+      "suspicious": {
+        "noConsole": "error",
+        "noEmptyBlockStatements": "error",
+        "noExplicitAny": "error",
+        "useIterableCallbackReturn": "error"
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["frontend/vite.config.ts"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noDefaultExport": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["frontend/scripts/**"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noConsole": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "frontend/src/**",
+        "!frontend/src/components/ui/provider.tsx"
+      ],
+      "plugins": [
+        "./biome-plugins/no-raw-colors.grit",
+        "./biome-plugins/no-raw-colors-css.grit"
+      ]
+    }
+  ]
+}

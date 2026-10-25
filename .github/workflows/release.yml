@@ -1,0 +1,1151 @@
+name: Release
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-version:
+    name: Validate version
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Validate version format
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "Invalid version format. Must be vX.Y.Z or vX.Y.Z-suffix"
+            exit 1
+          fi
+
+  create-release-draft:
+    name: Create release draft
+    needs:
+      - validate-version
+    permissions:
+      contents: write # create the draft release
+    runs-on: ubuntu-22.04
+    outputs:
+      release_id: ${{ steps.release.outputs.id }}
+    steps:
+      - name: Create or reuse release draft
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          release_id=$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.tag_name == env.GITHUB_REF_NAME) | .id' | head -n 1)
+          if [ -z "$release_id" ]; then
+            prerelease=false
+            [[ "$GITHUB_REF_NAME" == *-* ]] && prerelease=true
+            release_id=$(gh api "repos/$GH_REPO/releases" \
+              -f tag_name="$GITHUB_REF_NAME" \
+              -f name="KFtray - $GITHUB_REF_NAME" \
+              -F draft=true \
+              -F prerelease="$prerelease" \
+              --jq .id)
+          fi
+          echo "id=$release_id" >> "$GITHUB_OUTPUT"
+
+  kftray-tauri:
+    name: kftray (${{ matrix.os }}, ${{ matrix.arch }})
+    needs: create-release-draft
+    environment: release
+    permissions:
+      contents: write # upload app bundles to the draft release
+      id-token: write # sign build provenance attestations
+      attestations: write # store build provenance attestations
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            arch: arm64
+            runner: ubuntu-22.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            tauri_args: "--target aarch64-unknown-linux-gnu --bundles appimage,updater --verbose"
+          - os: ubuntu-22.04
+            arch: amd64
+            rust_target: x86_64-unknown-linux-gnu
+            tauri_args: "--target x86_64-unknown-linux-gnu --bundles appimage,updater --verbose"
+            # The webview bundle is the same for every non-Windows target, so
+            # one job per bundle flavour uploads its source maps (see
+            # frontend/scripts/sourcemaps.mjs).
+            upload_sourcemaps: true
+          - os: ubuntu-24.04
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            tauri_args: "--target aarch64-unknown-linux-gnu --bundles appimage,updater --verbose"
+            asset_name_pattern: "kftray_[version]_newer-glibc_aarch64[ext]"
+          - os: ubuntu-24.04
+            arch: amd64
+            rust_target: x86_64-unknown-linux-gnu
+            tauri_args: "--target x86_64-unknown-linux-gnu --bundles appimage,updater --verbose"
+            asset_name_pattern: "kftray_[version]_newer-glibc_amd64[ext]"
+          - os: macos-latest
+            arch: universal
+            rust_target: universal-apple-darwin
+            tauri_args: "--target universal-apple-darwin --bundles dmg,app,updater --verbose"
+          - os: windows-latest
+            arch: x86
+            rust_target: i686-pc-windows-msvc
+            tauri_args: "--target i686-pc-windows-msvc --bundles nsis,updater --verbose"
+            msvc_arch: x86
+          - os: windows-latest
+            arch: x86_64
+            rust_target: x86_64-pc-windows-msvc
+            tauri_args: "--target x86_64-pc-windows-msvc --bundles nsis,updater --verbose"
+            msvc_arch: x64
+            upload_sourcemaps: true
+          - os: windows-latest
+            arch: arm64
+            rust_target: aarch64-pc-windows-msvc
+            tauri_args: "--target aarch64-pc-windows-msvc --bundles nsis,updater --verbose"
+
+    runs-on: ${{ matrix.runner || matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          if [ "$RUST_TARGET" = "universal-apple-darwin" ]; then
+            rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          else
+            rustup target add "$RUST_TARGET"
+          fi
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Set up Visual Studio shell
+        if: matrix.os == 'windows-latest' && matrix.arch == 'arm64'
+        uses: TheMrMilchmann/setup-msvc-dev@368ef7d1ee4d1171b31d4a7f67f4d954f903f5a9 # v4.1.0
+        with:
+          arch: amd64_arm64
+
+      - name: Setup platform-specific dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt install -y \
+              build-essential \
+              curl \
+              wget \
+              file \
+              libxdo-dev \
+              libssl-dev \
+              libayatana-appindicator3-dev \
+              librsvg2-dev \
+              libwebkit2gtk-4.1-dev \
+              patchelf \
+              xdg-utils
+
+      - name: Setup platform-specific dependencies (Ubuntu 24.04)
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          sudo apt-get update
+          sudo apt install -y \
+              build-essential \
+              curl \
+              wget \
+              file \
+              libxdo-dev \
+              libssl-dev \
+              libayatana-appindicator3-dev \
+              librsvg2-dev \
+              libwebkit2gtk-4.1-0=2.44.0-2 \
+              libwebkit2gtk-4.1-dev=2.44.0-2 \
+              libjavascriptcoregtk-4.1-0=2.44.0-2 \
+              libjavascriptcoregtk-4.1-dev=2.44.0-2 \
+              gir1.2-javascriptcoregtk-4.1=2.44.0-2 \
+              gir1.2-webkit2-4.1=2.44.0-2 \
+              patchelf \
+              xdg-utils
+
+      - name: Install NASM and Ninja on Windows
+        if: matrix.os == 'windows-latest'
+        run: choco install nasm ninja
+
+      - name: Build kftray-helper for multiple architectures (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cargo build --bin kftray-helper --release --target x86_64-apple-darwin
+          cargo build --bin kftray-helper --release --target aarch64-apple-darwin
+          cp -rf ./target/aarch64-apple-darwin/release/kftray-helper ./target/release/kftray-helper-aarch64-apple-darwin
+          cp -rf ./target/x86_64-apple-darwin/release/kftray-helper ./target/release/kftray-helper-x86_64-apple-darwin
+          lipo -create -output ./crates/kftray-tauri/bin/kftray-helper-universal-apple-darwin ./target/release/kftray-helper-x86_64-apple-darwin ./target/release/kftray-helper-aarch64-apple-darwin
+        shell: bash
+
+      - name: Sign and notarize the helper binary
+        if: matrix.os == 'macos-latest'
+        uses: toitlang/action-macos-sign-notarize@385e50b59cf23df408e3361c28d3d665f4730dd1 # v1.3.0
+        with:
+          certificate: ${{ secrets.APPLE_CERTIFICATE }}
+          certificate-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          username: ${{ secrets.APPLE_ID }}
+          password: ${{ secrets.APPLE_PASSWORD }}
+          apple-team-id: 6M376JWU73
+          app-path: crates/kftray-tauri/bin/kftray-helper-universal-apple-darwin
+          entitlements-path: crates/kftray-helper/macos-helper-entitlements.plist
+
+      - name: Set CMAKE_GENERATOR for x86/x64 Windows
+        if: matrix.os == 'windows-latest' && matrix.arch != 'arm64'
+        shell: bash
+        run: echo "CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
+
+      - name: Keep debug info for GlitchTip debug files
+        shell: bash
+        run: |
+          echo "CARGO_PROFILE_RELEASE_DEBUG=line-tables-only" >> "$GITHUB_ENV"
+          case "$RUNNER_OS" in
+            Linux) echo "CARGO_PROFILE_RELEASE_STRIP=none" >> "$GITHUB_ENV" ;;
+            macOS) echo "CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed" >> "$GITHUB_ENV" ;;
+            Windows) echo "CARGO_PROFILE_RELEASE_STRIP=false" >> "$GITHUB_ENV" ;;
+          esac
+
+      - name: Import Apple Developer Certificate
+        if: matrix.os == 'macos-latest'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          security list-keychains -d user -s build.keychain login.keychain-db
+
+      - name: Extract Signing Identity
+        if: matrix.os == 'macos-latest'
+        run: |
+          CERT_INFO=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application")
+          CERT_ID=$(echo "$CERT_INFO" | awk -F'"' '{print $2}')
+          echo "APPLE_SIGNING_IDENTITY=$CERT_ID" >> "$GITHUB_ENV"
+          echo "Certificate identity: $CERT_ID"
+
+      - name: Build kftray-tauri Desktop App
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
+        id: tauri_build
+        continue-on-error: true
+        env: &tauri-build-env
+          AWS_LC_SYS_PREBUILT_NASM: ${{ matrix.os == 'windows-latest' && '1' || '' }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_OPTIONS: --max-old-space-size=6000
+          # GlitchTip: every job uploads its own debug files; only the jobs
+          # flagged above upload the (shared) webview source maps.
+          SENTRY_URL: https://glitchtip.cavarsa.app
+          SENTRY_ORG: ${{ vars.GLITCHTIP_ORG || 'kftray' }}
+          SENTRY_PROJECT: ${{ vars.GLITCHTIP_PROJECT || 'kftray' }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.GLITCHTIP_AUTH_TOKEN }}
+          KFTRAY_UPLOAD_SOURCEMAPS: ${{ matrix.upload_sourcemaps && 'true' || '' }}
+          KFTRAY_CARGO_BIN_NAME: kftray-tauri
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
+        with: &tauri-build-with
+          tagName: ${{ github.ref_name }}
+          releaseName: "KFtray - ${{ github.ref_name }}"
+          releaseBody: "See the assets to download this version and install."
+          releaseDraft: true
+          releaseAssetNamePattern: ${{ matrix.asset_name_pattern || '' }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          args: ${{ matrix.tauri_args }}
+
+      - name: Retry Build on Failure
+        if: steps.tauri_build.outcome == 'failure'
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
+        env: *tauri-build-env
+        with: *tauri-build-with
+
+      - name: Strip bundled libglvnd from AppImage
+        if: startsWith(matrix.os, 'ubuntu')
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          ASSET_NAME_PATTERN: ${{ matrix.asset_name_pattern }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+
+          version="${GITHUB_REF_NAME#v}"
+          bundle_dir="target/$RUST_TARGET/release/bundle/appimage"
+          local_appimage="$(find "$bundle_dir" -maxdepth 1 -name 'kftray_*.AppImage' -type f -print -quit 2>/dev/null || true)"
+          if [ -z "$local_appimage" ]; then
+            echo "::warning::No AppImage at $bundle_dir; skipping libglvnd strip"
+            exit 0
+          fi
+
+          # Match the asset name tauri-action uploaded so --clobber targets
+          # the right asset (each matrix entry must produce a unique name).
+          if [ -n "${ASSET_NAME_PATTERN:-}" ]; then
+            expected_name="${ASSET_NAME_PATTERN//\[version\]/$version}"
+            expected_name="${expected_name//\[ext\]/.AppImage}"
+            target_path="$bundle_dir/$expected_name"
+            [ "$local_appimage" != "$target_path" ] && mv "$local_appimage" "$target_path"
+            appimage="$(realpath "$target_path")"
+          else
+            appimage="$(realpath "$local_appimage")"
+          fi
+          asset_name="$(basename "$appimage")"
+
+          arch_kernel="x86_64"
+          [ "$ARCH" = "arm64" ] && arch_kernel="aarch64"
+
+          work="$(mktemp -d)"
+          pushd "$work" >/dev/null
+          "$appimage" --appimage-extract >/dev/null
+
+          # Drop libraries that MUST come from the host system. Bundling them
+          # causes ABI/protocol mismatches with the host's GPU drivers and
+          # Wayland compositor, resulting in blank windows or EGL_BAD_PARAMETER.
+          #
+          # libglvnd family: host GPU driver dispatching (#547)
+          # libgbm: Mesa buffer management, tied to kernel DRM
+          # libwayland-*: protocol version must match host compositor
+          find squashfs-root \( -type f -o -type l \) \( \
+              -name 'libGL.so*' -o \
+              -name 'libEGL.so*' -o \
+              -name 'libGLX.so*' -o \
+              -name 'libGLdispatch.so*' -o \
+              -name 'libgbm.so*' -o \
+              -name 'libwayland-client.so*' -o \
+              -name 'libwayland-cursor.so*' -o \
+              -name 'libwayland-egl.so*' -o \
+              -name 'libwayland-server.so*' \
+              \) -delete
+
+          chmod -R u+rwX,go+rX,go-w squashfs-root
+
+          curl -fsSL --retry 3 -o appimagetool.AppImage \
+              "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${arch_kernel}.AppImage"
+          chmod +x appimagetool.AppImage
+
+          rm -f "$appimage" "$appimage.sig" "$appimage.zsync"
+          update_info="gh-releases-zsync|${GITHUB_REPOSITORY%%/*}|${GITHUB_REPOSITORY#*/}|latest|${asset_name/$version/*[0-9]}.zsync"
+          ARCH="$arch_kernel" ./appimagetool.AppImage --no-appstream -u "$update_info" squashfs-root "$appimage"
+          [ -f "$work/$asset_name.zsync" ] && mv "$work/$asset_name.zsync" "$appimage.zsync"
+          popd >/dev/null
+
+          npx --yes @tauri-apps/cli@^2 signer sign \
+              --private-key "$TAURI_SIGNING_PRIVATE_KEY" \
+              --password "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" \
+              "$appimage"
+
+          gh release upload "${GITHUB_REF_NAME}" "$appimage" "$appimage.sig" "$appimage.zsync" --clobber
+          echo "Re-uploaded $asset_name (libglvnd-free) with regenerated signature and zsync"
+
+          rm -rf "$work"
+
+      - name: Find built artifacts for attestation
+        id: find_artifacts
+        shell: bash
+        env:
+          OS: ${{ matrix.os }}
+          ARCH: ${{ matrix.arch }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          if [ "$OS" == "macos-latest" ]; then
+            ARTIFACTS=$(find target/universal-apple-darwin/release/bundle -type f \( -name "*.dmg" -o -name "*.app.tar.gz" \) 2>/dev/null || echo "")
+          elif [[ "$OS" == ubuntu-* ]]; then
+            ARTIFACTS=$(find "target/$RUST_TARGET/release/bundle" -type f -name "*.AppImage" 2>/dev/null || echo "")
+          else
+            ARTIFACTS=$(find "target/$RUST_TARGET/release/bundle" -type f \( -name "*.exe" -o -name "*.msi" \) ! -path "*nsis*Uninstall*" 2>/dev/null || echo "")
+          fi
+          if [ -z "$ARTIFACTS" ]; then
+            echo "::warning::No artifacts found for attestation on $OS ($ARCH)"
+          else
+            echo "Found artifacts:"
+            echo "$ARTIFACTS"
+            {
+              echo "artifacts<<EOF"
+              echo "$ARTIFACTS"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate build provenance attestation
+        if: steps.find_artifacts.outputs.artifacts != ''
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.find_artifacts.outputs.artifacts }}
+
+  kftui:
+    name: kftui (${{ matrix.os_name }}, ${{ matrix.arch }})
+    needs: create-release-draft
+    environment: release
+    permissions:
+      contents: write # upload kftui binaries to the draft release
+      id-token: write # sign build provenance attestations
+      attestations: write # store build provenance attestations
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            runner: ubuntu-22.04-arm
+            arch: arm64
+            rust_target: aarch64-unknown-linux-gnu
+            os_name: linux
+          - os: ubuntu-22.04
+            arch: amd64
+            rust_target: x86_64-unknown-linux-gnu
+            os_name: linux
+          - os: macos-latest
+            arch: universal
+            rust_target: universal-apple-darwin
+            os_name: macos
+          - os: windows-latest
+            arch: x86
+            rust_target: i686-pc-windows-msvc
+            msvc_arch: x86
+            os_name: windows
+          - os: windows-latest
+            arch: x86_64
+            rust_target: x86_64-pc-windows-msvc
+            msvc_arch: x64
+            os_name: windows
+          - os: windows-latest
+            arch: arm64
+            rust_target: aarch64-pc-windows-msvc
+            os_name: windows
+
+    runs-on: ${{  matrix.runner || matrix.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          if [ "$RUST_TARGET" = "universal-apple-darwin" ]; then
+            rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          else
+            rustup target add "$RUST_TARGET"
+          fi
+
+      - name: Setup platform-specific dependencies
+        if: startsWith(matrix.os, 'ubuntu-')
+        run: |
+          sudo apt-get update
+          sudo apt install -y \
+              build-essential \
+              curl \
+              wget \
+              file \
+              libxdo-dev \
+              libssl-dev \
+              libayatana-appindicator3-dev \
+              librsvg2-dev \
+              libwebkit2gtk-4.1-dev \
+              patchelf \
+              xdg-utils
+
+      - name: Set up Visual Studio shell
+        if: matrix.os == 'windows-latest' && matrix.arch == 'arm64'
+        uses: TheMrMilchmann/setup-msvc-dev@368ef7d1ee4d1171b31d4a7f67f4d954f903f5a9 # v4.1.0
+        with:
+          arch: amd64_arm64
+
+      - name: Install NASM and Ninja on Windows
+        if: matrix.os == 'windows-latest'
+        run: |
+          choco install nasm ninja
+
+      - name: Set up Perl on Windows
+        if: matrix.os == 'windows-latest'
+        uses: shogo82148/actions-setup-perl@8b574cdc2dffdae49f803204a4f2b716a2fa1db7 # v1.44.2
+        with:
+          perl-version: "5.42"
+          distribution: "strawberry"
+
+      - name: Set Perl environment variables
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          echo "PERL=$((where.exe perl)[0])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          echo "OPENSSL_SRC_PERL=$((where.exe perl)[0])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Set CMAKE_GENERATOR for x86/x64 Windows
+        if: matrix.os == 'windows-latest' && matrix.arch != 'arm64'
+        shell: bash
+        run: echo "CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
+
+      - name: Keep debug info for GlitchTip debug files
+        shell: bash
+        run: |
+          echo "CARGO_PROFILE_RELEASE_DEBUG=line-tables-only" >> "$GITHUB_ENV"
+          case "$RUNNER_OS" in
+            Linux) echo "CARGO_PROFILE_RELEASE_STRIP=none" >> "$GITHUB_ENV" ;;
+            macOS) echo "CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed" >> "$GITHUB_ENV" ;;
+            Windows) echo "CARGO_PROFILE_RELEASE_STRIP=false" >> "$GITHUB_ENV" ;;
+          esac
+
+      - name: Build kftui (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "1"
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: cargo build --release --bin kftui --target $env:RUST_TARGET
+
+      - name: Build kftui
+        if: matrix.os != 'windows-latest'
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          if [ "$RUST_TARGET" = "universal-apple-darwin" ]; then
+            cargo build --release --bin kftui --target aarch64-apple-darwin
+            cargo build --release --bin kftui --target x86_64-apple-darwin
+            lipo -create -output ./target/release/kftui ./target/x86_64-apple-darwin/release/kftui ./target/aarch64-apple-darwin/release/kftui
+          else
+            cargo build --release --bin kftui --target "$RUST_TARGET"
+          fi
+        shell: bash
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Upload debug files to GlitchTip
+        shell: bash
+        env:
+          SENTRY_URL: https://glitchtip.cavarsa.app
+          SENTRY_ORG: ${{ vars.GLITCHTIP_ORG || 'kftray' }}
+          SENTRY_PROJECT: ${{ vars.GLITCHTIP_PROJECT || 'kftray' }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.GLITCHTIP_AUTH_TOKEN }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: node frontend/scripts/debug-files.mjs kftui "$RUST_TARGET"
+
+      - name: Sign and notarize the release build
+        if: matrix.os == 'macos-latest'
+        uses: toitlang/action-macos-sign-notarize@385e50b59cf23df408e3361c28d3d665f4730dd1 # v1.3.0
+        with:
+          certificate: ${{ secrets.APPLE_CERTIFICATE }}
+          certificate-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          username: ${{ secrets.APPLE_ID }}
+          password: ${{ secrets.APPLE_PASSWORD }}
+          apple-team-id: 6M376JWU73
+          app-path: target/release/kftui
+          entitlements-path: crates/kftui/entitlements.plist
+
+      - name: Rename and upload release asset
+        id: upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+          ASSET: kftui_${{ matrix.os_name }}_${{ matrix.arch }}
+        run: |
+          ext=""
+          src="target/$RUST_TARGET/release/kftui"
+          case "$RUST_TARGET" in
+            universal-apple-darwin) src="target/release/kftui" ;;
+            *-windows-msvc) ext=".exe"; src="$src.exe" ;;
+          esac
+          binary="target/release/$ASSET$ext"
+          archive="target/release/$ASSET.tar.gz"
+
+          mkdir -p target/release
+          mv "$src" "$binary"
+          chmod +x "$binary"
+          tar -C target/release -czf "$archive" "$ASSET$ext"
+
+          gh release upload "$GITHUB_REF_NAME" "$binary" "$archive" --clobber
+          {
+            echo "artifacts<<EOF"
+            echo "$archive"
+            echo "$binary"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate build provenance attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.upload.outputs.artifacts }}
+
+  kftray-server:
+    name: kftray-server image
+    needs: create-release-draft
+    outputs:
+      digest: ${{ steps.docker_build.outputs.digest }}
+    permissions:
+      contents: read
+      packages: write # push the kftray-server image to GHCR
+      id-token: write # keyless cosign signing and provenance attestation
+      attestations: write # store the image provenance attestation
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    env:
+      DOCKER_PLATFORMS: linux/amd64,linux/arm64
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: ${{ env.DOCKER_PLATFORMS }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: |
+            network=host
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/kftray-server
+          tags: |
+            type=sha
+            type=ref,event=tag
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        id: docker_build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          platforms: ${{ env.DOCKER_PLATFORMS }}
+          context: .
+          file: ./crates/kftray-server/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            REVISION=${{ github.sha }}
+            CREATED=${{ github.event.head_commit.timestamp }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/kftray-server
+          subject-digest: ${{ steps.docker_build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign Docker image with Cosign (keyless)
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/kftray-server
+          DIGEST: ${{ steps.docker_build.outputs.digest }}
+        run: cosign sign --yes "$IMAGE@$DIGEST"
+
+  sbom-pipeline:
+    name: Generate, scan and sign SBOMs
+    needs: [ kftray-server, kftui, kftray-tauri ]
+    permissions:
+      contents: read
+      packages: read # pull the kftray-server image for SBOM generation and scanning
+      id-token: write # Required for OIDC keyless signing
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      # === SBOM Generation ===
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-cyclonedx@0.5.9
+
+      - name: Setup mise
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          cache: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate kftray SBOM
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: mise run sbom:kftray
+
+      - name: Generate kftui SBOM
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: mise run sbom:kftui
+
+      - name: Generate kftray-server SBOM
+        env:
+          DOCKER_IMAGE: ghcr.io/${{ github.repository_owner }}/kftray-server@${{ needs.kftray-server.outputs.digest }}
+          VERSION: ${{ github.ref_name }}
+        run: mise run sbom:kftray-server
+
+      # === SBOM Scanning ===
+      - name: Scan kftray SBOM
+        run: |
+          grype sbom:sbom-kftray.cdx.json --quiet --fail-on high --show-suppressed -o json=vuln-report-kftray.json
+
+      - name: Scan kftui SBOM
+        run: |
+          grype sbom:sbom-kftui.cdx.json --quiet --fail-on high --show-suppressed -o json=vuln-report-kftui.json
+
+      - name: Scan kftray-server image
+        env:
+          DOCKER_IMAGE: ghcr.io/${{ github.repository_owner }}/kftray-server@${{ needs.kftray-server.outputs.digest }}
+        run: |
+          grype "$DOCKER_IMAGE" --quiet --fail-on high --show-suppressed -o json=vuln-report-kftray-server.json
+
+      # === SBOM Signing ===
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign all SBOMs
+        run: |
+          for sbom in sbom-kftray.cdx.json sbom-kftui.cdx.json sbom-kftray-server.cdx.json; do
+            cosign sign-blob --yes \
+              --bundle "${sbom}.bundle.json" \
+              "$sbom"
+          done
+
+      - name: Sign VEX document
+        run: |
+          cosign sign-blob --yes \
+            --bundle .vex.openvex.json.bundle.json \
+            .vex.openvex.json
+
+      - name: Upload signed artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-signed
+          include-hidden-files: true
+          path: |
+            sbom-kftray.cdx.json
+            sbom-kftray.cdx.json.bundle.json
+            sbom-kftui.cdx.json
+            sbom-kftui.cdx.json.bundle.json
+            sbom-kftray-server.cdx.json
+            sbom-kftray-server.cdx.json.bundle.json
+            .vex.openvex.json
+            .vex.openvex.json.bundle.json
+            vuln-report-kftray.json
+            vuln-report-kftui.json
+            vuln-report-kftray-server.json
+
+  update-release:
+    name: Publish release
+    needs: [ create-release-draft, sbom-pipeline ]
+    permissions:
+      contents: write # update release notes, latest.json and publish the release
+    runs-on: ubuntu-22.04
+    if: |
+      startsWith(github.ref, 'refs/tags/v') &&
+      !contains(github.ref_name, '-')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4.9.1
+        id: git-cliff
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update release notes
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          RELEASE_NOTES: ${{ steps.git-cliff.outputs.content }}
+          RELEASE_ID: ${{ needs.create-release-draft.outputs.release_id }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            try {
+              await github.rest.repos.updateRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: Number(process.env.RELEASE_ID),
+                body: process.env.RELEASE_NOTES,
+                tag_name: process.env.GITHUB_REF_NAME,
+                name: `KFtray - ${process.env.GITHUB_REF_NAME}`
+              });
+            } catch (error) {
+              console.error('Failed to update release notes:', error);
+              if (error.status === 404) {
+                console.log('Release not found, retrying after short delay...');
+                await new Promise(resolve => setTimeout(resolve, 5000));
+                await github.rest.repos.updateRelease({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  release_id: Number(process.env.RELEASE_ID),
+                  body: process.env.RELEASE_NOTES,
+                  tag_name: process.env.GITHUB_REF_NAME,
+                  name: `KFtray - ${process.env.GITHUB_REF_NAME}`
+                });
+              } else {
+                throw error;
+              }
+            }
+
+      - name: Use direct download URLs in latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ needs.create-release-draft.outputs.release_id }}
+        run: |
+          set -euo pipefail
+
+          # tauri-action v1 writes api.github.com asset URLs, which are rate limited for anonymous clients
+          assets=$(gh api "repos/$GH_REPO/releases/$RELEASE_ID/assets?per_page=100")
+          latest_id=$(jq -r 'map(select(.name == "latest.json")) | .[0].id // empty' <<<"$assets")
+          if [ -z "$latest_id" ]; then
+            echo "::warning::latest.json not found on release $RELEASE_ID"
+            exit 0
+          fi
+
+          gh api -H "Accept: application/octet-stream" "repos/$GH_REPO/releases/assets/$latest_id" > latest.json
+          jq --argjson assets "$assets" --arg base "https://github.com/$GH_REPO/releases/download/$GITHUB_REF_NAME/" '
+            .platforms |= with_entries(
+              .value.url |= (
+                if test("^https://api.github.com/repos/.+/releases/assets/[0-9]+$") then
+                  (sub(".*/assets/"; "") | tonumber) as $id
+                  | ($assets | map(select(.id == $id)) | .[0].name) as $name
+                  | if $name == null then . else $base + $name end
+                else . end
+              )
+            )' latest.json > latest.direct.json
+          mv latest.direct.json latest.json
+          gh release upload "$GITHUB_REF_NAME" latest.json --clobber
+
+      - name: Setup uv for updater metadata
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Finalize updater metadata before publishing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: uv run hacks/fix_updater_json.py "$GITHUB_REF_NAME"
+
+      - name: Publish release
+        uses: eregon/publish-release@01df127f5e9a3c26935118e22e738d95b59d10ce # v1.0.6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          release_id: ${{ needs.create-release-draft.outputs.release_id }}
+
+  publish-cargo-crates:
+    name: Publish crates to crates.io
+    needs: [ sbom-pipeline ]
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # crates.io trusted publishing
+    runs-on: ubuntu-22.04
+    if: |
+      startsWith(github.ref, 'refs/tags/v') &&
+      !contains(github.ref_name, '-')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt install -y \
+              build-essential \
+              curl \
+              wget \
+              file \
+              libxdo-dev \
+              libssl-dev \
+              libayatana-appindicator3-dev \
+              librsvg2-dev \
+              libwebkit2gtk-4.1-dev \
+              patchelf \
+              xdg-utils
+
+      - name: Authenticate with crates.io (kftray-commons)
+        id: crates-io-auth-commons
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish kftray-commons
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth-commons.outputs.token }}
+        run: |
+          ./hacks/publish-crate.sh crates/kftray-commons
+          echo "Waiting 60s to avoid rate limiting..."
+          sleep 60
+
+      - name: Authenticate with crates.io (kftray-telemetry)
+        id: crates-io-auth-telemetry
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish kftray-telemetry
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth-telemetry.outputs.token }}
+        run: |
+          ./hacks/publish-crate.sh crates/kftray-telemetry
+          echo "Waiting 60s to avoid rate limiting..."
+          sleep 60
+
+      - name: Authenticate with crates.io (kftray-helper)
+        id: crates-io-auth-helper
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish kftray-helper
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth-helper.outputs.token }}
+        run: |
+          ./hacks/publish-crate.sh crates/kftray-helper
+          echo "Waiting 60s to avoid rate limiting..."
+          sleep 60
+
+      - name: Authenticate with crates.io (kftray-http-logs)
+        id: crates-io-auth-http-logs
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish kftray-http-logs
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth-http-logs.outputs.token }}
+        run: |
+          ./hacks/publish-crate.sh crates/kftray-http-logs
+          echo "Waiting 60s to avoid rate limiting..."
+          sleep 60
+
+      - name: Authenticate with crates.io (kftray-portforward)
+        id: crates-io-auth-portforward
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish kftray-portforward
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth-portforward.outputs.token }}
+        run: |
+          ./hacks/publish-crate.sh crates/kftray-portforward
+          echo "Waiting 60s to avoid rate limiting..."
+          sleep 60
+
+      - name: Authenticate with crates.io (kftray-network-monitor)
+        id: crates-io-auth-network-monitor
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish kftray-network-monitor
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth-network-monitor.outputs.token }}
+        run: |
+          ./hacks/publish-crate.sh crates/kftray-network-monitor
+          echo "Waiting 60s to avoid rate limiting..."
+          sleep 60
+
+      - name: Authenticate with crates.io (kftui)
+        id: crates-io-auth-kftui
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish kftui
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth-kftui.outputs.token }}
+        run: |
+          ./hacks/publish-crate.sh crates/kftui
+          echo "All crates published successfully!"
+
+  publish-linux-packages:
+    name: Publish Linux packages to OBS
+    needs: [ update-release ]
+    environment: release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    concurrency:
+      group: obs-publishing
+      cancel-in-progress: false
+    if: |
+      startsWith(github.ref, 'refs/tags/v') &&
+      !contains(github.ref_name, '-')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup and publish to OBS
+        env:
+          OBS_USER: ${{ secrets.OBS_USER }}
+          OBS_PASSWORD: ${{ secrets.OBS_PASSWORD }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          export VERSION
+
+          chmod +x ./hacks/obs/*.sh
+          ./hacks/obs/setup.sh
+          ./hacks/obs/publish.sh
+
+  sbom-publish:
+    name: Publish SBOMs
+    needs: [ update-release, sbom-pipeline, kftray-server ]
+    permissions:
+      contents: write # upload SBOMs, VEX and scan reports to the release
+      id-token: write # Required for OIDC token for attestation signing
+      attestations: write # Required for creating attestations
+      packages: write # Required for push-to-registry: true (pushes attestation to GHCR)
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download signed artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sbom-signed
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # === SBOM Attestation ===
+      - name: Generate SBOM attestation
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/kftray-server
+          subject-digest: ${{ needs.kftray-server.outputs.digest }}
+          sbom-path: sbom-kftray-server.cdx.json
+          push-to-registry: true
+
+      # === Upload to Release ===
+      - name: Upload to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            sbom-kftray.cdx.json \
+            sbom-kftray.cdx.json.bundle.json \
+            sbom-kftui.cdx.json \
+            sbom-kftui.cdx.json.bundle.json \
+            sbom-kftray-server.cdx.json \
+            sbom-kftray-server.cdx.json.bundle.json \
+            .vex.openvex.json \
+            .vex.openvex.json.bundle.json \
+            vuln-report-kftray.json \
+            vuln-report-kftui.json \
+            vuln-report-kftray-server.json \
+            --clobber
+
+  post-release-tasks:
+    name: Update Homebrew tap
+    needs: [ update-release ]
+    environment: release
+    permissions:
+      contents: read
+    runs-on: macos-latest
+    if: |
+      startsWith(github.ref, 'refs/tags/v') &&
+      !contains(github.ref_name, '-')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Install Python dependencies
+        working-directory: hacks
+        run: uv sync
+
+      - name: Update Homebrew formulas
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        working-directory: hacks
+        run: |
+          uv run python update_homebrew.py \
+            "$GITHUB_REPOSITORY" \
+            "$GITHUB_REF_NAME" \
+            "hcavarsan/homebrew-kftray" \
+            "$GH_TOKEN"

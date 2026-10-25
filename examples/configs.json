@@ -1,28 +1,57 @@
 [
- {
-  "service": "argocd-server",
-  "namespace": "argocd",
-  "local_port": 8888,
-  "remote_port": 8080,
-  "context": "test-cluster",
-  "workload_type": "service",
-  "protocol": "tcp",
-  "remote_address": "",
-  "local_address": "127.0.0.1",
-  "alias": "argocd",
-  "domain_enabled": true
- },
- {
-  "service": "backstage-ui",
-  "namespace": "backstage",
-  "local_port": 8085,
-  "remote_port": 8080,
-  "context": "test-cluster",
-  "workload_type": "service",
-  "protocol": "tcp",
-  "remote_address": "",
-  "local_address": "127.0.0.1",
-  "alias": "argocd",
-  "domain_enabled": true
- }
+  {
+    "alias": "argocd",
+    "context": "kind-kftray-cluster",
+    "kubeconfig": "/Users/henrique/.kube/kind-config-kftray-cluster",
+    "local_port": 16080,
+    "namespace": "argocd",
+    "protocol": "tcp",
+    "remote_port": 8080,
+    "service": "argocd-server",
+    "workload_type": "service"
+  },
+  {
+    "alias": "grafana",
+    "context": "kind-kftray-cluster",
+    "kubeconfig": "/Users/henrique/.kube/kind-config-kftray-cluster",
+    "local_port": 13080,
+    "namespace": "monitoring",
+    "protocol": "tcp",
+    "remote_port": 3000,
+    "service": "grafana",
+    "workload_type": "service"
+  },
+  {
+    "alias": "alertmanager",
+    "context": "kind-kftray-cluster",
+    "kubeconfig": "/Users/henrique/.kube/kind-config-kftray-cluster",
+    "local_port": 19093,
+    "namespace": "monitoring",
+    "protocol": "tcp",
+    "remote_port": 9093,
+    "service": "prometheus-alertmanager",
+    "workload_type": "service"
+  },
+  {
+    "alias": "prometheus",
+    "context": "kind-kftray-cluster",
+    "kubeconfig": "/Users/henrique/.kube/kind-config-kftray-cluster",
+    "local_port": 19090,
+    "namespace": "monitoring",
+    "protocol": "tcp",
+    "remote_port": 9090,
+    "service": "prometheus-server",
+    "workload_type": "service"
+  },
+  {
+    "alias": "jaeger",
+    "context": "kind-kftray-cluster",
+    "kubeconfig": "/Users/henrique/.kube/kind-config-kftray-cluster",
+    "local_port": 15090,
+    "namespace": "observability",
+    "protocol": "tcp",
+    "remote_port": 16686,
+    "service": "jaeger-query",
+    "workload_type": "service"
+  }
 ]

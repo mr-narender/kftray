@@ -1,148 +1,68 @@
-import React, { useState } from 'react'
-import { MdDelete } from 'react-icons/md'
+import { useState } from 'react'
+import { Trash2 } from 'lucide-react'
 
-import {
-  AlertDialog,
-  AlertDialogBody,
-  AlertDialogContent,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogOverlay,
-  Box,
-  Button,
-  IconButton,
-  Tooltip,
-} from '@chakra-ui/react'
-import { invoke } from '@tauri-apps/api/tauri'
+import { Box } from '@chakra-ui/react'
+import { useMutation } from '@tanstack/react-query'
 
-import { BulkDeleteButtonProps, Status } from '../../../types'
-import useCustomToast from '../../CustomToast'
+import { FooterActionButton } from '@/components/Footer/FooterActionButton'
+import { ConfirmDialog } from '@/components/ui/dialog'
+import { Tooltip } from '@/components/ui/tooltip'
+import type { Config } from '@/types'
 
-const BulkDeleteButton: React.FC<BulkDeleteButtonProps> = ({
+interface BulkDeleteButtonProps {
+  selectedConfigs: Config[]
+  deleteConfigs: (ids: number[]) => Promise<boolean>
+}
+
+export function BulkDeleteButton({
   selectedConfigs,
-  setSelectedConfigs,
-  configs,
-  setConfigs,
-}) => {
-  const cancelRef = React.useRef<HTMLButtonElement>(null)
-  const [isBulkAlertOpen, setIsBulkAlertOpen] = useState(false)
-  const [configsToDelete, setConfigsToDelete] = useState<number[]>([])
-  const toast = useCustomToast()
+  deleteConfigs,
+}: BulkDeleteButtonProps) {
+  const [idsToDelete, setIdsToDelete] = useState<number[] | null>(null)
 
-  const handleDeleteConfigs = (selectedIds: number[]) => {
-    setConfigsToDelete(selectedIds)
-    setIsBulkAlertOpen(true)
-  }
+  const deleteMutation = useMutation({
+    mutationFn: deleteConfigs,
+    onSuccess: deleted => {
+      if (deleted) {
+        setIdsToDelete(null)
+      }
+    },
+  })
 
-  const confirmDeleteConfigs = async () => {
-    if (!Array.isArray(configsToDelete) || !configsToDelete.length) {
-      toast({
-        title: 'Error',
-        description: 'No configurations selected for deletion.',
-        status: 'error',
-      })
-
-      return
-    }
-
-    try {
-      await invoke('delete_configs', { ids: configsToDelete })
-
-      const configsAfterDeletion = await invoke<Status[]>('get_configs')
-      const runningStateMap = new Map(
-        configs.map(conf => [conf.id, conf.isRunning]),
-      )
-
-      const updatedConfigs = configsAfterDeletion.map(conf => ({
-        ...conf,
-        isRunning: runningStateMap.get(conf.id) ?? false,
-      }))
-
-      setConfigs(updatedConfigs)
-      setSelectedConfigs([])
-
-      toast({
-        title: 'Success',
-        description: 'Configurations deleted successfully.',
-        status: 'success',
-      })
-    } catch (error) {
-      console.error('Failed to delete configurations:', error)
-      toast({
-        title: 'Error',
-        description: 'Failed to delete configurations: "unknown error"',
-        status: 'error',
-      })
-    }
-
-    setIsBulkAlertOpen(false)
+  if (!selectedConfigs.length) {
+    return null
   }
 
   return (
     <Box>
-      {selectedConfigs.length > 0 && (
-        <Tooltip
-          label='Delete Configs'
-          placement='top'
-          fontSize='xs'
-          lineHeight='tight'
-        >
-          <IconButton
-            colorScheme='red'
-            variant='outline'
-            onClick={() =>
-              handleDeleteConfigs(selectedConfigs.map(config => config.id))
-            }
-            size='sm'
-            aria-label='Delete selected configs'
-            borderColor='gray.700'
-            icon={<MdDelete />}
-            ml={2}
-          />
-        </Tooltip>
-      )}
-
-      <AlertDialog
-        isOpen={isBulkAlertOpen}
-        leastDestructiveRef={cancelRef}
-        onClose={() => setIsBulkAlertOpen(false)}
+      <Tooltip
+        content='Delete Selected Configs'
+        positioning={{
+          placement: 'top-end',
+          offset: { mainAxis: 8, crossAxis: 0 },
+        }}
       >
-        <AlertDialogOverlay
-          style={{ alignItems: 'flex-start', justifyContent: 'flex-start' }}
-          bg='transparent'
+        <FooterActionButton
+          aria-label='Delete selected configs'
+          onClick={() =>
+            setIdsToDelete(selectedConfigs.map(config => config.id))
+          }
+          bg='danger.solid'
+          _hover={{ bg: 'danger.emphasized' }}
         >
-          <AlertDialogContent>
-            <AlertDialogHeader fontSize='xs' fontWeight='bold'>
-              Delete Config(s)
-            </AlertDialogHeader>
+          <Box as={Trash2} width='12px' height='12px' />
+        </FooterActionButton>
+      </Tooltip>
 
-            <AlertDialogBody fontSize='xs'>
-              Are you sure you want to delete the selected config(s)? This
-              action cannot be undone.
-            </AlertDialogBody>
-
-            <AlertDialogFooter>
-              <Button
-                ref={cancelRef}
-                onClick={() => setIsBulkAlertOpen(false)}
-                size='xs'
-              >
-                Cancel
-              </Button>
-              <Button
-                colorScheme='red'
-                onClick={confirmDeleteConfigs}
-                ml={3}
-                size='xs'
-              >
-                Delete
-              </Button>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialogOverlay>
-      </AlertDialog>
+      {idsToDelete && (
+        <ConfirmDialog
+          title='Delete Config(s)'
+          description={`Are you sure you want to delete ${idsToDelete.length} selected config${idsToDelete.length === 1 ? '' : 's'}? This action cannot be undone.`}
+          isPending={deleteMutation.isPending}
+          onConfirm={() => deleteMutation.mutate(idsToDelete)}
+          onClose={() => setIdsToDelete(null)}
+        />
+      )}
     </Box>
   )
 }
-
-export default BulkDeleteButton

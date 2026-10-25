@@ -1,0 +1,22 @@
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--chakra-colors-border-strong) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--chakra-colors-border-strong);
+  border-radius: 2px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--chakra-colors-border-strong);
+}

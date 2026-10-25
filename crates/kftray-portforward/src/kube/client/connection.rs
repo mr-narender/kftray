@@ -1,0 +1,634 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::LazyLock;
+use std::time::{
+    Duration,
+    Instant,
+};
+
+use hyper_openssl::client::legacy::HttpsConnector;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioExecutor;
+use kube::Client;
+use kube::client::ConfigExt;
+use kube::config::Config;
+use log::{
+    error,
+    info,
+    warn,
+};
+use openssl::ssl::{
+    SslConnector,
+    SslMethod,
+    SslSessionCacheMode,
+    SslVerifyMode,
+};
+use tower::ServiceBuilder;
+
+use super::config::ConfigExtClone;
+use super::error::{
+    KubeClientError,
+    KubeResult,
+};
+use super::proxy::{
+    create_insecure_with_proxy,
+    create_openssl_with_proxy,
+    create_rustls_with_proxy,
+};
+
+type StrategyFuture<'a> = Pin<Box<dyn Future<Output = KubeResult<Client>> + Send + 'a>>;
+type Strategy<'a> = (&'static str, StrategyFuture<'a>);
+
+const POOL_MAX_IDLE_PER_HOST: usize = 5;
+
+/// Idle keep-alive connections are only reaped when the pool has a timer
+/// (`pool_timer`, not `timer`); without one they stay open until the client
+/// itself is dropped.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Total budget for connecting to and probing the API server. Independent
+/// of `Config::read_timeout`, which governs already-established requests
+/// (e.g. watches) rather than how long a connection attempt may take.
+const CONNECTION_BUDGET: Duration = Duration::from_secs(30);
+
+/// Minimum time reserved for each strategy still to come, so a slow first
+/// strategy cannot exhaust the whole budget before later strategies get a
+/// chance to run.
+const MIN_STRATEGY_SLICE: Duration = Duration::from_secs(5);
+
+static HTTP_CONNECTOR: LazyLock<HttpConnector> = LazyLock::new(|| {
+    let mut connector = HttpConnector::new();
+    connector.set_nodelay(true);
+    connector.enforce_http(false);
+    connector
+});
+
+pub async fn create_client_with_config(config: &Config) -> KubeResult<Client> {
+    let config = config.clone();
+
+    let strategies = if config.accept_invalid_certs {
+        info!("Creating insecure connection strategies for skip-tls-verify=true");
+        create_insecure_connection_strategies(&config)
+    } else {
+        create_connection_strategies(&config)
+    };
+
+    execute_strategies(strategies, CONNECTION_BUDGET).await
+}
+
+/// Runs every strategy against ONE overall deadline instead of giving each
+/// strategy its own full timeout: with 3-4 strategies a per-strategy budget
+/// would let a hung API server block the caller for 3-4x the intended
+/// timeout. Each strategy (connection + version probe) gets whatever budget
+/// remains from the overall deadline; a strategy is skipped once the budget
+/// is exhausted.
+async fn execute_strategies(
+    strategies: Vec<Strategy<'_>>, total_budget: Duration,
+) -> KubeResult<Client> {
+    let mut failed_attempts = Vec::new();
+    let mut skipped_attempts = Vec::new();
+    let mut last_error: Option<KubeClientError> = None;
+    let deadline = Instant::now() + total_budget;
+    let strategy_count = strategies.len();
+
+    for (index, (description, strategy)) in strategies.into_iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            warn!("Strategy '{description}' skipped: overall connection budget exhausted");
+            skipped_attempts.push(description.to_string());
+            last_error.get_or_insert_with(|| {
+                KubeClientError::connection_error(
+                    "Timed out connecting to the Kubernetes API server",
+                )
+            });
+            continue;
+        }
+
+        let strategies_after = (strategy_count - index - 1) as u32;
+        let reserved_for_rest = MIN_STRATEGY_SLICE.saturating_mul(strategies_after);
+        let after_reservation = remaining.saturating_sub(reserved_for_rest);
+        // With strategies still to come, giving this one the whole remaining
+        // budget (instead of skipping it) would exhaust the time reserved
+        // for them, letting one slow strategy starve every later one.
+        if after_reservation.is_zero() && strategies_after > 0 {
+            warn!(
+                "Strategy '{description}' skipped: no budget remains after reserving time for \
+                 {strategies_after} more strategies"
+            );
+            skipped_attempts.push(description.to_string());
+            last_error.get_or_insert_with(|| {
+                KubeClientError::connection_error(
+                    "Timed out connecting to the Kubernetes API server",
+                )
+            });
+            continue;
+        }
+        let strategy_budget = if after_reservation.is_zero() {
+            remaining
+        } else {
+            after_reservation
+        };
+        let strategy_deadline = Instant::now() + strategy_budget;
+
+        info!("Attempting strategy: {description}");
+
+        let result = match tokio::time::timeout(strategy_budget, strategy).await {
+            Ok(Ok(client)) => {
+                let probe_remaining = strategy_deadline.saturating_duration_since(Instant::now());
+                if probe_remaining.is_zero() {
+                    Err(KubeClientError::connection_error(
+                        "Timed out connecting to the Kubernetes API server",
+                    ))
+                } else {
+                    test_client_connection(&client, probe_remaining)
+                        .await
+                        .map(|_| client)
+                }
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(KubeClientError::connection_error(
+                "Timed out connecting to the Kubernetes API server",
+            )),
+        };
+
+        match result {
+            Ok(client) => {
+                info!("Successfully connected using: {description}");
+                return Ok(client);
+            }
+            Err(e) => {
+                warn!("Strategy '{description}' failed: {e}");
+                failed_attempts.push(description.to_string());
+                last_error = Some(e);
+            }
+        }
+    }
+
+    log_connection_failure(&failed_attempts, &skipped_attempts, last_error.as_ref());
+
+    Err(last_error
+        .unwrap_or_else(|| KubeClientError::connection_error("No connection strategies available")))
+}
+
+fn create_connection_strategies(config: &Config) -> Vec<Strategy<'_>> {
+    let original = config.clone();
+    let without_invalid_certs = config.clone_with_invalid_certs(false);
+
+    vec![
+        create_rustls_strategy("Rustls (original settings)", original.clone()),
+        create_openssl_strategy(
+            "OpenSSL (original settings)",
+            original.clone(),
+            original.accept_invalid_certs,
+        ),
+        create_openssl_strategy(
+            "OpenSSL (with cert verification)",
+            without_invalid_certs,
+            false,
+        ),
+    ]
+}
+
+fn create_insecure_connection_strategies(config: &Config) -> Vec<Strategy<'_>> {
+    let original = config.clone();
+    let with_invalid_certs = config.clone_with_invalid_certs(true);
+
+    vec![
+        create_openssl_strategy(
+            "OpenSSL (skip cert verification)",
+            with_invalid_certs.clone(),
+            true,
+        ),
+        create_openssl_strategy(
+            "OpenSSL (original settings)",
+            original.clone(),
+            original.accept_invalid_certs,
+        ),
+        create_rustls_strategy("Rustls (original settings)", original),
+        create_insecure_strategy("Insecure HTTP", with_invalid_certs),
+    ]
+}
+
+fn create_rustls_strategy(description: &'static str, config: Config) -> Strategy<'static> {
+    (
+        description,
+        Box::pin(async move { create_rustls_client(config).await }),
+    )
+}
+
+fn create_openssl_strategy(
+    description: &'static str, config: Config, skip_verify: bool,
+) -> Strategy<'static> {
+    (
+        description,
+        Box::pin(async move { create_openssl_client(config, skip_verify).await }),
+    )
+}
+
+fn create_insecure_strategy(description: &'static str, config: Config) -> Strategy<'static> {
+    (
+        description,
+        Box::pin(async move { create_insecure_client(config).await }),
+    )
+}
+
+async fn create_rustls_client(config: Config) -> KubeResult<Client> {
+    if let Some(proxy_url) = config.proxy_url.clone() {
+        return create_rustls_with_proxy(config, &proxy_url).await;
+    }
+
+    let connector = config.rustls_https_connector().map_err(|e| {
+        KubeClientError::connection_error_with_source("Failed to create Rustls connector", e)
+    })?;
+
+    let hyper_client = create_hyper_client(connector);
+    build_kube_client(config, hyper_client)
+}
+
+async fn create_openssl_client(config: Config, skip_verify: bool) -> KubeResult<Client> {
+    if let Some(proxy_url) = config.proxy_url.clone() {
+        let ssl_builder = config.openssl_ssl_connector_builder().map_err(|e| {
+            KubeClientError::connection_error_with_source(
+                "Failed to create SSL connector with client certificates",
+                e,
+            )
+        })?;
+        let http_connector = create_http_connector();
+        return create_openssl_with_proxy(config, ssl_builder, http_connector, &proxy_url).await;
+    }
+
+    let ssl_connector = create_ssl_connector(skip_verify)?;
+    let http_connector = create_http_connector();
+
+    let https_connector =
+        HttpsConnector::with_connector(http_connector, ssl_connector).map_err(|e| {
+            KubeClientError::connection_error_with_source("Failed to create HTTPS connector", e)
+        })?;
+
+    let hyper_client = create_hyper_client(https_connector);
+    build_kube_client(config, hyper_client)
+}
+
+async fn create_insecure_client(config: Config) -> KubeResult<Client> {
+    let http_connector = create_http_connector();
+
+    if let Some(proxy_url) = config.proxy_url.clone() {
+        return create_insecure_with_proxy(config, http_connector, &proxy_url).await;
+    }
+
+    let hyper_client = create_hyper_client(http_connector);
+    build_kube_client(config, hyper_client)
+}
+
+fn create_ssl_connector(skip_verify: bool) -> KubeResult<openssl::ssl::SslConnectorBuilder> {
+    let mut builder = SslConnector::builder(SslMethod::tls()).map_err(|e| {
+        KubeClientError::connection_error_with_source(
+            "Failed to create SSL connector (ensure OpenSSL is properly configured)",
+            e,
+        )
+    })?;
+
+    builder.set_verify(if skip_verify {
+        SslVerifyMode::NONE
+    } else {
+        SslVerifyMode::PEER
+    });
+
+    builder.set_session_cache_mode(SslSessionCacheMode::CLIENT);
+
+    Ok(builder)
+}
+
+pub fn create_http_connector() -> HttpConnector {
+    HTTP_CONNECTOR.clone()
+}
+
+pub fn create_hyper_client<C>(
+    connector: C,
+) -> hyper_util::client::legacy::Client<C, kube::client::Body>
+where
+    C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
+{
+    use hyper_util::rt::TokioTimer;
+
+    hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+        .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .retry_canceled_requests(true)
+        .timer(TokioTimer::new())
+        .pool_timer(TokioTimer::new())
+        .build(connector)
+}
+
+/// Probes the API server under a deadline. A server that accepts the
+/// connection but never answers would otherwise hang every caller that waits
+/// on a client, including stop.
+async fn test_client_connection(client: &Client, probe_timeout: Duration) -> KubeResult<()> {
+    tokio::time::timeout(probe_timeout, client.apiserver_version())
+        .await
+        .map_err(|_| {
+            KubeClientError::connection_error(
+                "Timed out waiting for the Kubernetes API server version",
+            )
+        })?
+        .map_err(|e| {
+            KubeClientError::connection_error_with_source(
+                "Failed to connect to Kubernetes API server",
+                e,
+            )
+        })?;
+    Ok(())
+}
+
+pub fn build_kube_client<C>(
+    config: Config, hyper_client: hyper_util::client::legacy::Client<C, kube::client::Body>,
+) -> KubeResult<Client>
+where
+    C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
+{
+    let auth_layer = config
+        .auth_layer()
+        .map_err(|e| auth_layer_error(&config, e))?;
+
+    let service = ServiceBuilder::new()
+        .layer(config.base_uri_layer())
+        .option_layer(auth_layer)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+        .service(hyper_client);
+
+    Ok(Client::new(service, config.default_namespace))
+}
+
+/// The failure of an exec credential plugin is reported by what it is: the
+/// command and its exit status. kube's own message embeds the full
+/// `KUBERNETES_EXEC_INFO` environment, including the cluster's CA, which
+/// says nothing about why the plugin failed and would otherwise reach the
+/// toast and the config state row.
+fn auth_layer_error(config: &Config, error: kube::Error) -> KubeClientError {
+    use kube::client::AuthError;
+
+    let command = config
+        .auth_info
+        .exec
+        .as_ref()
+        .and_then(|exec| exec.command.as_deref())
+        .unwrap_or("the auth exec plugin");
+    match &error {
+        kube::Error::Auth(AuthError::AuthExecRun { status, out, .. }) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let detail = match stderr.trim() {
+                "" => "run it from a terminal to see why".to_string(),
+                text => text.to_string(),
+            };
+            error!("Auth exec plugin {command} failed with {status}: {detail}");
+            KubeClientError::auth_error(format!("{command} failed with {status}: {detail}"))
+        }
+        kube::Error::Auth(AuthError::AuthExecStart(io)) => {
+            error!("Auth exec plugin {command} could not be started: {io}");
+            KubeClientError::auth_error(format!("{command} could not be started: {io}"))
+        }
+        kube::Error::Auth(AuthError::MissingCommand) => {
+            error!("Auth exec plugin has no command specified in kubeconfig");
+            KubeClientError::auth_error("The kubeconfig's exec plugin has no command")
+        }
+        _ => {
+            warn!("Failed to create auth layer: {error}. Debug: {error:?}");
+            KubeClientError::auth_error_with_source("Failed to create auth layer", error)
+        }
+    }
+}
+
+fn log_connection_failure(
+    failed_attempts: &[String], skipped_attempts: &[String], last_error: Option<&KubeClientError>,
+) {
+    if failed_attempts.is_empty() && skipped_attempts.is_empty() {
+        error!("No connection strategies available");
+        return;
+    }
+
+    let mut summary = Vec::new();
+    if !failed_attempts.is_empty() {
+        summary.push(format!(
+            "{} failed: {}",
+            failed_attempts.len(),
+            failed_attempts.join(", ")
+        ));
+    }
+    if !skipped_attempts.is_empty() {
+        summary.push(format!(
+            "{} skipped (budget exhausted before they ran): {}",
+            skipped_attempts.len(),
+            skipped_attempts.join(", ")
+        ));
+    }
+    let summary = summary.join("; ");
+
+    match last_error {
+        Some(err) => error!("All connection strategies failed. Last error: {err}. {summary}"),
+        None => error!("All connection strategies failed. {summary}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_plugin_failure_keeps_the_cause_without_the_command_environment() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{
+            ExitStatus,
+            Output,
+        };
+
+        let mut config = Config::new("https://example.com".parse().unwrap());
+        config.auth_info.exec = Some(kube::config::ExecConfig {
+            command: Some("gke-gcloud-auth-plugin".to_string()),
+            ..Default::default()
+        });
+        for stderr in [b"mise: no version selected".as_slice(), b"".as_slice()] {
+            let status = ExitStatus::from_raw(256);
+            let error = kube::Error::Auth(kube::client::AuthError::AuthExecRun {
+                cmd: "KUBERNETES_EXEC_INFO=cluster-certificate gke-gcloud-auth-plugin".to_string(),
+                status,
+                out: Output {
+                    status,
+                    stdout: Vec::new(),
+                    stderr: stderr.to_vec(),
+                },
+            });
+            let message = auth_layer_error(&config, error).to_string();
+            assert!(message.contains("gke-gcloud-auth-plugin"), "{message}");
+            assert!(message.contains("exit status: 1"), "{message}");
+            assert!(!message.contains("KUBERNETES_EXEC_INFO"), "{message}");
+            assert!(!message.contains("cluster-certificate"), "{message}");
+            if stderr.is_empty() {
+                assert!(message.contains("run it from a terminal"), "{message}");
+            } else {
+                assert!(message.contains("mise: no version selected"), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_connection_strategies_count() {
+        let config = Config::new("https://example.com".parse().unwrap());
+        let strategies = create_connection_strategies(&config);
+        assert_eq!(strategies.len(), 3);
+
+        let mut insecure_config = Config::new("https://example.com".parse().unwrap());
+        insecure_config.accept_invalid_certs = true;
+        let insecure_strategies = create_insecure_connection_strategies(&insecure_config);
+        assert_eq!(insecure_strategies.len(), 4);
+    }
+
+    #[test]
+    fn test_http_connector_configuration() {
+        let connector = create_http_connector();
+        drop(connector);
+    }
+
+    #[test]
+    fn test_ssl_connector_verify_modes() {
+        let connector_verify = create_ssl_connector(false);
+        assert!(connector_verify.is_ok());
+
+        let connector_no_verify = create_ssl_connector(true);
+        assert!(connector_no_verify.is_ok());
+    }
+
+    #[test]
+    fn test_proxy_url_parsing() {
+        let mut config = Config::new("https://example.com".parse().unwrap());
+        config.proxy_url = Some("http://proxy.example.com:8080".parse().unwrap());
+
+        assert!(config.proxy_url.is_some());
+        let proxy_url = config.proxy_url.as_ref().unwrap();
+        assert_eq!(proxy_url.scheme_str(), Some("http"));
+        assert_eq!(proxy_url.host(), Some("proxy.example.com"));
+        assert_eq!(proxy_url.port_u16(), Some(8080));
+    }
+
+    #[test]
+    fn test_socks5_proxy_url() {
+        let mut config = Config::new("https://example.com".parse().unwrap());
+        config.proxy_url = Some("socks5://localhost:1080".parse().unwrap());
+
+        assert!(config.proxy_url.is_some());
+        let proxy_url = config.proxy_url.as_ref().unwrap();
+        assert_eq!(proxy_url.scheme_str(), Some("socks5"));
+        assert_eq!(proxy_url.host(), Some("localhost"));
+        assert_eq!(proxy_url.port_u16(), Some(1080));
+    }
+
+    #[test]
+    fn test_error_creation() {
+        let error = KubeClientError::connection_error("Test connection error");
+        assert!(matches!(error, KubeClientError::ConnectionError { .. }));
+        assert_eq!(error.to_string(), "Connection error: Test connection error");
+    }
+
+    #[tokio::test]
+    async fn execute_strategies_shares_one_budget_across_strategies() {
+        fn slow_strategy(description: &'static str) -> Strategy<'static> {
+            (
+                description,
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    Err(KubeClientError::connection_error("unreachable"))
+                }),
+            )
+        }
+
+        let strategies = vec![
+            slow_strategy("slow-1"),
+            slow_strategy("slow-2"),
+            slow_strategy("slow-3"),
+        ];
+
+        let start = Instant::now();
+        let result = execute_strategies(strategies, Duration::from_millis(100)).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "every strategy exceeds the shared budget");
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "elapsed {elapsed:?} implies each strategy got its own timeout instead of \
+             sharing one overall budget (3 strategies x 200ms would be >= 600ms)"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_strategies_reserves_slice_for_later_strategies() {
+        fn timeout_prone_strategy(description: &'static str, sleep_ms: u64) -> Strategy<'static> {
+            (
+                description,
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                    Err(KubeClientError::connection_error("unreachable"))
+                }),
+            )
+        }
+
+        // total_budget (5100ms) - MIN_STRATEGY_SLICE (5000ms) reserved for the
+        // one remaining strategy leaves the first strategy only ~100ms. A
+        // slow first strategy must be cut off there instead of eating into
+        // the second strategy's reserved slice.
+        let strategies = vec![
+            timeout_prone_strategy("slow-first", 250),
+            timeout_prone_strategy("fast-second", 1),
+        ];
+
+        let start = Instant::now();
+        let result = execute_strategies(strategies, Duration::from_millis(5100)).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "both strategies fail or time out");
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "elapsed {elapsed:?} implies the first strategy was not capped at its reserved \
+             slice (~100ms); the previous `.max(remaining.min(MIN_STRATEGY_SLICE))` clamp undid \
+             the reservation and let the first strategy run its full 250ms sleep instead of \
+             timing out at ~100ms, leaving less than the intended slice for the second strategy"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_strategies_skips_a_strategy_with_no_budget_left_after_reservation() {
+        fn timeout_prone_strategy(description: &'static str, sleep_ms: u64) -> Strategy<'static> {
+            (
+                description,
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                    Err(KubeClientError::connection_error("unreachable"))
+                }),
+            )
+        }
+
+        // After the first strategy's 300ms, ~4900ms remain: less than the
+        // 5000ms `MIN_STRATEGY_SLICE` reserved for the still-pending third
+        // strategy, so `after_reservation` is zero for the second strategy
+        // while a strategy still follows it. The second strategy sleeps
+        // 4000ms so a regression that gives it the whole remaining budget
+        // instead of skipping it shows up as several extra seconds of
+        // elapsed time rather than the near-instant skip this asserts.
+        let strategies = vec![
+            timeout_prone_strategy("first", 300),
+            timeout_prone_strategy("would-exhaust-the-reservation", 4000),
+            timeout_prone_strategy("third", 0),
+        ];
+
+        let start = Instant::now();
+        let result = execute_strategies(strategies, Duration::from_millis(5200)).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "every strategy fails or is skipped");
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "elapsed {elapsed:?} implies the second strategy ran with the whole remaining \
+             budget (~4900ms) instead of being skipped once no budget was left after \
+             reserving time for the third strategy"
+        );
+    }
+}

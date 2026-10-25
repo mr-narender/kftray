@@ -1,0 +1,10 @@
+import { queryOptions } from '@tanstack/react-query'
+
+import { invoke } from '@/lib/tauri'
+
+import type { LogFileInfo } from './types'
+
+export const logFilesQuery = queryOptions({
+  queryKey: ['log-files'],
+  queryFn: () => invoke<LogFileInfo[]>('list_log_files'),
+})

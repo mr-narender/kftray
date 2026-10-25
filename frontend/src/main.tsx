@@ -1,15 +1,14 @@
-import React from 'react'
-import ReactDOM from 'react-dom/client'
-import { QueryClient, QueryClientProvider } from 'react-query'
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
 
-import { ChakraProvider } from '@chakra-ui/react'
+import { App } from './App'
+import { ErrorBoundary } from './components/ErrorBoundary'
+import { Provider } from './components/ui/provider'
+import { initCrashReporting } from './lib/telemetry'
 
-import theme from './assets/theme'
-import App from './App'
+import './index.css'
 
-import './assets/style.css'
-
-const queryClient = new QueryClient()
+void initCrashReporting()
 
 const rootElement = document.getElementById('root')
 
@@ -17,13 +16,12 @@ if (!rootElement) {
   throw new Error('Failed to find the root element')
 }
 
-ReactDOM.createRoot(rootElement).render(
-  <React.StrictMode>
-    <QueryClientProvider client={queryClient}>
-      {' '}
-      <ChakraProvider theme={theme}>
+createRoot(rootElement).render(
+  <StrictMode>
+    <Provider>
+      <ErrorBoundary>
         <App />
-      </ChakraProvider>
-    </QueryClientProvider>
-  </React.StrictMode>,
+      </ErrorBoundary>
+    </Provider>
+  </StrictMode>,
 )

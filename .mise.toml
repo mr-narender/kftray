@@ -1,0 +1,435 @@
+[tools]
+node = "26"
+pnpm = "12.15.0"
+syft = "1.55.0"
+grype = "0.121.0"
+
+[tasks.dev]
+description = "Start Tauri development mode (tauri dev)"
+run = "cargo build --bin kftray-helper --release && pnpm tauri dev"
+
+[tasks.build]
+description = "Build Tauri application for production (tauri build)"
+run = "cargo build --bin kftray-helper --release && pnpm tauri build"
+
+[tasks."build:ui"]
+description = "Build only the frontend UI"
+run = "pnpm --filter @kftray/ui run build"
+
+[tasks."build:analyze"]
+description = "Build frontend with bundle analysis"
+run = "pnpm --filter @kftray/ui run build:analyze"
+
+[tasks.tauri]
+description = "Run tauri CLI directly"
+run = "cargo build --bin kftray-helper --release && pnpm tauri"
+
+[tasks."test:server"]
+description = "Run Docker proxy tests"
+run = "bash hacks/server/test_proxy.sh"
+
+[tasks."test:back"]
+description = "Run Rust backend tests with coverage"
+run = "cargo build --bin kftray-helper --release && INSTA_UPDATE=1 RUST_BACKTRACE=1 cargo llvm-cov nextest --profile ci --config-file .cargo/nextest.toml --locked --workspace --all-features --lib --bins --examples --tests"
+
+[tasks.check]
+description = "Run frontend type checking"
+run = "pnpm --filter @kftray/ui run check"
+
+[tasks."lint:front"]
+description = "Lint frontend code with Biome (with auto-fix)"
+run = "pnpm --filter @kftray/ui run lint"
+
+[tasks."lint:back"]
+description = "Lint backend code with Clippy (with auto-fix)"
+run = "cargo build --bin kftray-helper --release && cargo clippy --workspace --all-targets --all-features --fix --allow-dirty --allow-staged -- -D warnings"
+
+[tasks.lint]
+description = "Lint both frontend and backend (with auto-fix)"
+depends = ["lint:front", "lint:back"]
+
+[tasks."format:front"]
+description = "Format frontend code with Biome"
+run = "pnpm --filter @kftray/ui run format"
+
+[tasks."format:back"]
+description = "Format backend code with rustfmt"
+run = "rustup run nightly cargo fmt"
+
+[tasks.format]
+description = "Format both frontend and backend code"
+depends = ["format:front", "format:back"]
+
+[tasks."bump:patch"]
+description = "Bump patch version"
+run = "cd hacks/kftray-utils && cargo run --bin bump_version patch && cd ../.. && cargo update --workspace && git add -u && git commit -m 'chore: bump version'"
+
+[tasks."bump:minor"]
+description = "Bump minor version"
+run = "cd hacks/kftray-utils && cargo run --bin bump_version minor && cd ../.. && cargo update --workspace && git add -u && git commit -m 'chore: bump version'"
+
+[tasks."bump:major"]
+description = "Bump major version"
+run = "cd hacks/kftray-utils && cargo run --bin bump_version major && cd ../.. && cargo update --workspace && git add -u && git commit -m 'chore: bump version'"
+
+[tasks.precommit]
+description = "Run pre-commit checks (format, lint, test, sbom scan)"
+run = ["mise run format", "mise run lint", "mise run sbom:scan-all", "mise run test:back"]
+
+[tasks."precommit:hook"]
+description = "Run git pre-commit hook (format, check, git add)"
+run = ["mise run format", "cargo build --bin kftray-helper --release", "cargo check --workspace --all-targets --all-features", "git add -u"]
+
+[tasks."generate-icons"]
+description = "Generate application icons"
+run = "cargo run --manifest-path hacks/kftray-utils/Cargo.toml --bin generate_icons"
+
+[tasks.knip]
+description = "Detect unused files, exports and dependencies"
+run = "pnpm run knip"
+
+[tasks.kftui]
+description = "Run kftui CLI"
+run = "cargo run -p kftui -- --log-level info --logs-to-file"
+
+[tasks.e2e]
+description = "Run the whole e2e suite in Docker: build the app, start Xvfb and k3s, run every test and copy the results to target/"
+run = """
+set -e
+docker build --file crates/kftray-e2e/Dockerfile --tag kftray-e2e .
+docker rm --force kftray-e2e > /dev/null 2>&1 || true
+rm -rf target/e2e/artifacts target/nextest/e2e/junit.xml
+mkdir -p target/e2e target/nextest/e2e
+status=0
+docker run --name kftray-e2e --init --network host --privileged \
+  --env KFTRAY_E2E_TIMEOUT_SCALE --env RUST_LOG \
+  --volume /var/run/docker.sock:/var/run/docker.sock \
+  --volume kftray-e2e-target:/work/target \
+  --volume kftray-e2e-cargo-registry:/usr/local/cargo/registry \
+  --volume kftray-e2e-cargo-git:/usr/local/cargo/git \
+  kftray-e2e cargo run --package kftray-e2e -- run ${KFTRAY_E2E_COVERAGE:+--coverage} || status=$?
+copied=0
+docker cp kftray-e2e:/work/target/e2e/artifacts target/e2e/ > /dev/null 2>&1 || copied=$?
+docker cp kftray-e2e:/work/target/nextest/e2e/junit.xml target/nextest/e2e/ > /dev/null 2>&1 || copied=$?
+docker rm kftray-e2e > /dev/null
+if [ "$status" -eq 0 ] && [ "$copied" -ne 0 ]; then
+  echo "e2e passed but its junit or artifacts could not be copied out of the container" >&2
+  exit 1
+fi
+if [ "$status" -eq 0 ] && [ -n "$KFTRAY_E2E_COVERAGE" ] && [ ! -f target/e2e/artifacts/lcov.info ]; then
+  echo "e2e passed but produced no coverage report" >&2
+  exit 1
+fi
+if [ -f target/nextest/e2e/junit.xml ]; then
+  echo "e2e results: target/nextest/e2e/junit.xml, artifacts in target/e2e/artifacts"
+else
+  echo "e2e produced no junit; it failed before nextest ran" >&2
+fi
+exit $status
+"""
+
+[tasks."e2e:coverage"]
+description = "Run the whole e2e suite in Docker with coverage instrumentation, writing target/e2e/artifacts/lcov.info"
+env = { KFTRAY_E2E_COVERAGE = "1" }
+run = "mise run e2e"
+
+[tasks."e2e:native"]
+description = "Build the app, start a throwaway k3s and run the e2e suite on this machine's display"
+run = "cargo run -p kftray-e2e -- run"
+
+[tasks."e2e:up"]
+description = "Start the e2e environment and keep it up for cargo nextest --profile e2e"
+run = "cargo run -p kftray-e2e -- up"
+
+[tasks."e2e:build"]
+description = "Build kftray with the e2e feature and kftui"
+run = "cargo run -p kftray-e2e -- build"
+
+# Setup Task
+[tasks.setup]
+description = "Setup development environment for all platforms"
+run = "bash hacks/setup.sh"
+
+[tasks."sbom:install-tools"]
+description = "Install sbomasm and cargo-cyclonedx if not present"
+run = """
+# Install cargo-cyclonedx if not present
+if ! command -v cargo-cyclonedx > /dev/null 2>&1; then
+  echo "Installing cargo-cyclonedx..."
+  cargo install cargo-cyclonedx --quiet
+else
+  echo "cargo-cyclonedx already installed"
+fi
+
+# Check if sbomasm is already installed
+if command -v sbomasm > /dev/null 2>&1 && sbomasm version > /dev/null 2>&1; then
+  echo "sbomasm already installed: $(sbomasm version)"
+  exit 0
+fi
+
+if [ -x "$HOME/.local/bin/sbomasm" ] && "$HOME/.local/bin/sbomasm" version > /dev/null 2>&1; then
+  echo "sbomasm already installed at ~/.local/bin: $($HOME/.local/bin/sbomasm version)"
+  exit 0
+fi
+
+echo "Installing sbomasm..."
+mkdir -p ~/.local/bin
+# Checksums from: https://github.com/interlynk-io/sbomasm/releases/tag/v2.1.1
+SBOMASM_VERSION="2.1.1"
+OS=$(uname -s)
+ARCH=$(uname -m)
+
+if [ "$ARCH" = "x86_64" ]; then
+  SBOMASM_ARCH="x86_64"
+  if [ "$OS" = "Darwin" ]; then
+    EXPECTED_SHA="3ca7812b8289fd3a882e1870dc016508bee06e81f804c535210e0c1f43cffff9"
+  else
+    EXPECTED_SHA="643595183bb2f79fc123bee2fa7525f0e6585cb3806c38df1a8e758d66631a31"
+  fi
+elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+  SBOMASM_ARCH="arm64"
+  if [ "$OS" = "Darwin" ]; then
+    EXPECTED_SHA="cde3f4fd7e78617b0a337eaa246137ba0c613ff800efbad03ca5907cc02d6920"
+  else
+    EXPECTED_SHA="2af1103251f3227bc78e4e8df53305aa1cd4e83a4e5d9cbd7cf6ebf42c15ede6"
+  fi
+else
+  echo "ERROR: Unsupported architecture: $ARCH" >&2
+  exit 1
+fi
+
+DOWNLOAD_URL="https://github.com/interlynk-io/sbomasm/releases/download/v${SBOMASM_VERSION}/sbomasm_${SBOMASM_VERSION}_${OS}_${SBOMASM_ARCH}.tar.gz"
+TEMP_FILE=$(mktemp)
+
+echo "Downloading from $DOWNLOAD_URL..."
+curl -sSfL "$DOWNLOAD_URL" -o "$TEMP_FILE" || { echo "ERROR: Download failed" >&2; rm -f "$TEMP_FILE"; exit 1; }
+
+if command -v sha256sum > /dev/null 2>&1; then
+  ACTUAL_SHA=$(sha256sum "$TEMP_FILE" | cut -d' ' -f1)
+elif command -v shasum > /dev/null 2>&1; then
+  ACTUAL_SHA=$(shasum -a 256 "$TEMP_FILE" | cut -d' ' -f1)
+else
+  echo "ERROR: No sha256sum or shasum available for checksum verification" >&2
+  rm -f "$TEMP_FILE"
+  exit 1
+fi
+
+if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+  echo "ERROR: Checksum verification failed!" >&2
+  echo "Expected: $EXPECTED_SHA" >&2
+  echo "Actual:   $ACTUAL_SHA" >&2
+  rm -f "$TEMP_FILE"
+  exit 1
+fi
+
+tar -xzf "$TEMP_FILE" -C ~/.local/bin sbomasm
+chmod +x ~/.local/bin/sbomasm
+rm -f "$TEMP_FILE"
+
+if ! ~/.local/bin/sbomasm version > /dev/null 2>&1; then
+  echo "ERROR: sbomasm installation failed" >&2
+  exit 1
+fi
+
+echo "sbomasm installed successfully to ~/.local/bin/sbomasm"
+"""
+
+[tasks."sbom:kftray"]
+description = "Generate SBOM for kftray desktop app (Rust + Frontend)"
+env = { SYFT_CHECK_FOR_APP_UPDATE = "false" }
+depends = ["sbom:install-tools"]
+run = """
+export PATH="$HOME/.local/bin:$PATH"
+VERSION="${VERSION:-local}"
+
+echo "=== Generating SBOM for kftray desktop app ==="
+
+echo "Scanning frontend dependencies..."
+syft scan dir:frontend \
+  --base-path=frontend \
+  --exclude '**/node_modules/**/.github/**' \
+  --exclude '**/pnpm-lock.yaml' \
+  --source-name kftray-frontend \
+  --source-version $VERSION \
+  --enrich all \
+  -o cyclonedx-json@1.6=sbom-kftray-frontend.cdx.json
+
+echo "Generating SBOM for kftray-tauri backend..."
+cargo cyclonedx --manifest-path crates/kftray-tauri/Cargo.toml --format json --spec-version 1.5 --target all --override-filename sbom-kftray-backend
+mv crates/kftray-tauri/sbom-kftray-backend.json sbom-kftray-backend.cdx.json
+find crates -name "sbom-kftray-backend.json" -delete 2>/dev/null || true
+
+echo "Assembling kftray SBOM..."
+sbomasm assemble \
+  --flatMerge \
+  --outputSpecVersion 1.6 \
+  -n kftray \
+  -v $VERSION \
+  -t application \
+  -o sbom-kftray.cdx.json \
+  sbom-kftray-frontend.cdx.json sbom-kftray-backend.cdx.json
+
+echo "Adding supplier metadata and cleaning up..."
+jq '
+  .metadata.supplier = {"name": "KFtray Contributors", "url": ["https://github.com/hcavarsan/kftray"]} |
+  .components = [.components[] | select(.name != "kftray-frontend" or .type != "file")]
+' sbom-kftray.cdx.json > sbom-kftray.cdx.json.tmp \
+  && mv sbom-kftray.cdx.json.tmp sbom-kftray.cdx.json
+
+rm -f sbom-kftray-frontend.cdx.json sbom-kftray-backend.cdx.json
+echo "SBOM saved to sbom-kftray.cdx.json"
+"""
+
+[tasks."sbom:kftui"]
+description = "Generate SBOM for kftui CLI (Rust only)"
+depends = ["sbom:install-tools"]
+run = """
+export PATH="$HOME/.local/bin:$PATH"
+VERSION="${VERSION:-local}"
+
+echo "=== Generating SBOM for kftui CLI ==="
+
+cargo cyclonedx --manifest-path crates/kftui/Cargo.toml --format json --spec-version 1.5 --target all --override-filename sbom-kftui
+mv crates/kftui/sbom-kftui.json sbom-kftui.cdx.json
+find crates -name "sbom-kftui.json" -delete 2>/dev/null || true
+
+echo "Setting component type and adding supplier metadata..."
+jq '.metadata.component.type = "application" | .metadata.supplier = {"name": "KFtray Contributors", "url": ["https://github.com/hcavarsan/kftray"]}' sbom-kftui.cdx.json > sbom-kftui.cdx.json.tmp \
+  && mv sbom-kftui.cdx.json.tmp sbom-kftui.cdx.json
+
+echo "SBOM saved to sbom-kftui.cdx.json"
+"""
+
+[tasks."sbom:kftray-server"]
+description = "Generate SBOM for kftray-server Docker image"
+env = { SYFT_CHECK_FOR_APP_UPDATE = "false" }
+depends = ["sbom:install-tools"]
+run = """
+export PATH="$HOME/.local/bin:$PATH"
+VERSION="${VERSION:-local}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-ghcr.io/hcavarsan/kftray-server:latest}"
+
+echo "=== Generating SBOM for kftray-server Docker image ==="
+
+echo "Generating SBOM for kftray-server Rust crate..."
+cargo cyclonedx --manifest-path crates/kftray-server/Cargo.toml --format json --spec-version 1.5 --target all --override-filename sbom-kftray-server-rust
+mv crates/kftray-server/sbom-kftray-server-rust.json sbom-kftray-server-rust.cdx.json
+find crates -name "sbom-kftray-server-rust.json" -delete 2>/dev/null || true
+
+echo "Scanning Docker image: $DOCKER_IMAGE"
+syft scan $DOCKER_IMAGE \
+  --source-name kftray-server-container \
+  --source-version $VERSION \
+  --enrich all \
+  -o cyclonedx-json@1.6=sbom-kftray-server-docker.cdx.json
+
+echo "Assembling kftray-server SBOM..."
+sbomasm assemble \
+  --flatMerge \
+  --outputSpecVersion 1.6 \
+  -n kftray-server \
+  -v $VERSION \
+  -t container \
+  -o sbom-kftray-server.cdx.json \
+  sbom-kftray-server-rust.cdx.json sbom-kftray-server-docker.cdx.json
+
+echo "Adding supplier metadata and cleaning up..."
+jq '
+  .metadata.supplier = {"name": "KFtray Contributors", "url": ["https://github.com/hcavarsan/kftray"]} |
+  .components = [.components[] | select(.name != "kftray-server-container")]
+' sbom-kftray-server.cdx.json > sbom-kftray-server.cdx.json.tmp \
+  && mv sbom-kftray-server.cdx.json.tmp sbom-kftray-server.cdx.json
+
+rm -f sbom-kftray-server-rust.cdx.json sbom-kftray-server-docker.cdx.json
+echo "SBOM saved to sbom-kftray-server.cdx.json"
+"""
+
+[tasks."sbom:all"]
+description = "Generate SBOMs for all artifacts"
+depends = ["sbom:kftray", "sbom:kftui", "sbom:kftray-server"]
+run = """
+echo "=== All SBOMs generated ==="
+ls -la sbom-*.cdx.json 2>/dev/null || echo "No SBOMs found"
+"""
+
+[tasks."sbom:sign-all"]
+description = "Sign all SBOMs and VEX with Cosign keyless"
+run = """
+echo "=== Signing security artifacts ==="
+
+for sbom in sbom-kftray.cdx.json sbom-kftui.cdx.json sbom-kftray-server.cdx.json; do
+  if [ -f "$sbom" ]; then
+    echo "Signing $sbom..."
+    cosign sign-blob --yes \
+      --bundle "${sbom}.bundle.json" \
+      "$sbom"
+  fi
+done
+
+if [ -f ".vex.openvex.json" ]; then
+  echo "Signing .vex.openvex.json..."
+  cosign sign-blob --yes \
+    --bundle ".vex.openvex.json.bundle.json" \
+    ".vex.openvex.json"
+fi
+
+echo "=== All artifacts signed ==="
+ls -la *.bundle.json 2>/dev/null || echo "No bundles found"
+"""
+
+[tasks."sbom:scan-all"]
+description = "Scan all artifacts for vulnerabilities"
+depends = ["sbom:kftray", "sbom:kftui"]
+run = """
+echo "=== Scanning all artifacts ==="
+
+scan_artifact() {
+  local name="$1"
+  local target="$2"
+  local report="vuln-report-${name}.json"
+
+  echo "--- Scanning $name ---"
+
+  if ! grype "$target" --quiet --fail-on high --show-suppressed -o json="$report"; then
+    echo "FAIL: $name has high/critical vulnerabilities:"
+    jq -r '.matches[] | select(.vulnerability.severity == "Critical" or .vulnerability.severity == "High") | "  \\(.vulnerability.severity) | \\(.artifact.name)@\\(.artifact.version) | \\(.vulnerability.id)"' "$report" 2>/dev/null
+    return 1
+  fi
+
+  echo "  PASS: No high/critical vulnerabilities"
+  return 0
+}
+
+SCAN_FAILED=0
+
+scan_artifact "kftray" "sbom:sbom-kftray.cdx.json" || SCAN_FAILED=1
+scan_artifact "kftui" "sbom:sbom-kftui.cdx.json" || SCAN_FAILED=1
+
+DOCKER_IMAGE="${DOCKER_IMAGE:-ghcr.io/hcavarsan/kftray-server:latest}"
+mise run sbom:kftray-server
+scan_artifact "kftray-server" "$DOCKER_IMAGE" || SCAN_FAILED=1
+
+echo ""
+if [ "$SCAN_FAILED" -eq 1 ]; then
+  echo "=== SCAN FAILED ==="
+  exit 1
+fi
+
+echo "=== All scans passed ==="
+ls -la vuln-report-*.json sbom-*.cdx.json 2>/dev/null
+"""
+
+[tasks."sbom:view"]
+description = "View SBOM in human-readable format"
+depends = ["sbom:install-tools"]
+run = """
+export PATH="$HOME/.local/bin:$PATH"
+
+for sbom in sbom-kftray.cdx.json sbom-kftui.cdx.json sbom-kftray-server.cdx.json; do
+  if [ -f "$sbom" ]; then
+    echo "=== $sbom ==="
+    sbomasm view "$sbom"
+    echo ""
+  fi
+done
+"""

@@ -1,0 +1,32 @@
+[package]
+name = "kftray-http-logs"
+version = "0.33.0"
+authors = ["Henrique Cavarsan <hencavarsan@gmail.com>"]
+edition = "2024"
+description = "HTTP logging library for KFtray"
+homepage = "https://kftray.app"
+repository = "https://github.com/hcavarsan/kftray"
+license = "GPL-3.0"
+
+[lib]
+name = "kftray_http_logs"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+brotli = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+dashmap = { workspace = true }
+flate2 = { workspace = true }
+httparse = { workspace = true }
+kftray-commons = { workspace = true }
+lazy_static = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+mockall = { workspace = true }
+tempfile = { workspace = true }

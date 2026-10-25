@@ -1,258 +1,150 @@
-import { RefObject } from 'react'
+export type WorkloadType = 'service' | 'pod' | 'proxy' | 'expose'
 
-export interface Status {
+export type Protocol = 'tcp' | 'udp'
+
+export type ExposureType = 'cluster' | 'public'
+
+export type ExposureProtocol = 'http' | 'tcp'
+
+export type CertIssuerKind = 'ClusterIssuer' | 'Issuer'
+
+interface ConfigBase {
   id: number
-  service: string
-  context: string
-  local_port: number
-  isRunning: boolean
-  namespace: string
-  remote_port: number
-  local_address: string
-  domain_enabled: boolean
-  workload_type: string
-  protocol: string
-  alias: string
-  remote_address: string
-  cancelRef?: RefObject<HTMLButtonElement>
+  namespace?: string
+  local_port?: number
+  remote_port?: number
+  context?: string
+  protocol?: Protocol
+  local_address?: string
+  auto_loopback_address?: boolean
+  alias?: string
+  domain_enabled?: boolean
   kubeconfig?: string
+  http_logs_enabled?: boolean
+  http_logs_max_file_size?: number
+  http_logs_retention_days?: number
+  http_logs_auto_cleanup?: boolean
+  tags?: Record<string, string>
+  service?: string
+  target?: string
+  remote_address?: string
 }
 
-export interface Config {
-  id: number
+interface ServiceConfig extends ConfigBase {
+  workload_type: 'service'
+  service: string
+}
+
+interface PodConfig extends ConfigBase {
+  workload_type: 'pod'
+  target: string
+}
+
+interface ProxyConfig extends ConfigBase {
+  workload_type: 'proxy'
+  remote_address: string
+}
+
+interface ExposeConfig extends ConfigBase {
+  workload_type: 'expose'
+  alias: string
+  local_port: number
+  exposure_type?: ExposureType
+  exposure_protocol?: ExposureProtocol
+  cert_manager_enabled?: boolean
+  cert_issuer?: string
+  cert_issuer_kind?: CertIssuerKind
+  ingress_class?: string
+  ingress_annotations?: string
+}
+
+export type StoredConfig =
+  | ServiceConfig
+  | PodConfig
+  | ProxyConfig
+  | ExposeConfig
+
+export interface ForwardState {
+  is_running: boolean
+  is_retrying?: boolean
+  retry_count?: number | null
+  last_error?: string | null
+  owned_elsewhere?: boolean
+}
+
+export type Config = StoredConfig & ForwardState
+
+export interface ViewCondition {
+  field: string
+  values: string[]
+}
+
+export interface ConfigView {
+  group_by: string | null
+  filters: ViewCondition[]
+}
+
+interface ConfigGroup {
+  key: string | null
+  label: string
+  config_ids: number[]
+}
+
+interface FacetValue {
+  value: string
+  count: number
+}
+
+export interface Facet {
+  field: string
+  count: number
+  values: FacetValue[]
+}
+
+export interface ConfigViewResult {
+  view: ConfigView
+  groups: ConfigGroup[]
+  facets: Facet[]
+}
+
+export interface ResolvedGroup {
+  id: string
+  label: string
+  configs: Config[]
+}
+
+export type PortForwardAction = 'starting' | 'stopping' | 'saving' | 'deleting'
+
+export type PortForwardToggleAction = 'starting' | 'stopping'
+
+export interface PendingConfigAction {
+  action: PortForwardAction
+  token: number
+  timedOut?: boolean
+}
+
+export interface PortForwardResponse {
+  id: number | null
   service: string
   namespace: string
   local_port: number
-  local_address: string
-  domain_enabled: boolean
   remote_port: number
   context: string
-  alias: string
-  remote_address: string
-  workload_type: string
-  protocol: string
-  kubeconfig: string
-}
-
-export interface Response {
-  id: number
-  service: string
-  context: string
-  local_port: number
-  status: number
-  namespace: string
-  remote_port: number
-  alias: string
-  workload_type: string
-  protocol: string
-  remote_address: string
   stdout: string
   stderr: string
+  status: number
+  protocol: string
 }
 
-export interface GitConfig {
-  repoUrl: string
-  configPath: string
-  isPrivate: boolean
-  pollingInterval: number
-  token: string
-  flush: boolean
-}
-
-export interface ConfigProps {
-  isModalOpen: boolean
-  closeModal: () => void
-  newConfig: Config
-  handleInputChange: (event: React.ChangeEvent<HTMLInputElement>) => void
-  handleSaveConfig: (config: Config) => Promise<void>
-  handleEditSubmit: (e: React.FormEvent) => Promise<void>
-  cancelRef: RefObject<HTMLElement>
-  isEdit: boolean
-}
-
-export interface GitSyncModalProps {
-  isGitSyncModalOpen: boolean
-  closeGitSyncModal: () => void
-  onSettingsSaved: () => void
-  credentialsSaved: boolean
-  setCredentialsSaved: React.Dispatch<React.SetStateAction<boolean>>
-  setPollingInterval: React.Dispatch<React.SetStateAction<number>>
-  pollingInterval: number
-}
-
-export interface TableProps {
-  configs: Status[]
-  isInitiating: boolean
-  isStopping: boolean
-  isPortForwarding: boolean
-  initiatePortForwarding: (configs: Status[]) => Promise<void>
-  stopPortForwarding: (configs: Status[]) => Promise<void>
-  confirmDeleteConfig: () => void
-  handleDeleteConfig: (id: number) => void
-  handleEditConfig: (id: number) => void
-  isAlertOpen: boolean
-  setIsAlertOpen: (isOpen: boolean) => void
-  updateConfigRunningState: (id: number, isRunning: boolean) => void
-  selectedConfigs: Status[]
-  setSelectedConfigs: React.Dispatch<React.SetStateAction<Status[]>>
-  setIsInitiating: React.Dispatch<React.SetStateAction<boolean>>
-}
-
-export interface PortForwardRowProps {
-  config: Status
-  confirmDeleteConfig: () => void
-  handleDeleteConfig: (id: number) => void
-  handleEditConfig: (id: number) => void
-  isAlertOpen: boolean
-  setIsAlertOpen: (isOpen: boolean) => void
-  updateConfigRunningState: (id: number, isRunning: boolean) => void
-  showContext?: boolean
-  onSelectionChange: (isSelected: boolean) => void
-  updateSelectionState: (id: number, isRunning: boolean) => void
-  selected: boolean
-  isInitiating: boolean
-  setIsInitiating: React.Dispatch<React.SetStateAction<boolean>>
-  isStopping: boolean
-}
-
-export interface FooterProps {
-  openModal: () => void
-  openGitSyncModal: () => void
-  handleExportConfigs: () => void
-  handleImportConfigs: () => void
-  credentialsSaved: boolean
-  setCredentialsSaved: React.Dispatch<React.SetStateAction<boolean>>
-  onConfigsSynced: () => void
-  isGitSyncModalOpen: boolean
-  selectedConfigs: Status[]
-  setPollingInterval: React.Dispatch<React.SetStateAction<number>>
-  pollingInterval: number
-  setSelectedConfigs: React.Dispatch<React.SetStateAction<Status[]>>
-  configs: Status[]
-  setConfigs: React.Dispatch<React.SetStateAction<Status[]>>
-}
-
-export interface SyncConfigsButtonProps {
-  serviceName: string
-  accountName: string
-  onConfigsSynced?: () => void
-  onSyncFailure?: (error: Error) => void
-  credentialsSaved: boolean
-  setCredentialsSaved: React.Dispatch<React.SetStateAction<boolean>>
-  isGitSyncModalOpen: boolean
-  setPollingInterval: React.Dispatch<React.SetStateAction<number>>
-  pollingInterval: number
-}
-
-export interface Namespace {
-  namespace: string
-  name: string
-}
-
-export interface Context {
-  value: string
-  label: string
-}
+export type AuthMethod = 'none' | 'system' | 'token'
 
 export interface KubeContext {
   name: string
+  cluster?: string
+  user?: string
 }
 
-export interface Service {
-  name: string
-  service: string
-}
-
-export interface Port {
-  remote_port: number
-  name?: string
-  port?: number
-}
-
-export interface CustomConfigProps extends ConfigProps {
-  configData?: {
-    context?: KubeContext[]
-    namespace?: Namespace[]
-    service?: Service[]
-    port: number
-    name?: string
-    remote_port?: number
-    ports?: Port[]
-    kubeconfig?: string
-  }
-  setNewConfig: React.Dispatch<React.SetStateAction<Config>>
-}
-
-export type Option = { name: string; value: string | number; label: string }
-
-export interface CustomToastProps {
-  title: string
-  description: string
-  status: 'info' | 'warning' | 'success' | 'error'
-}
-
-export interface ShowToastParams {
-  title: string
-  description?: string
-  status?: 'info' | 'warning' | 'success' | 'error'
-  duration?: number
-  isClosable?: boolean
-  position?:
-    | 'top'
-    | 'top-right'
-    | 'top-left'
-    | 'bottom'
-    | 'bottom-right'
-    | 'bottom-left'
-}
-
-export interface ConfigsByContext {
-  [key: string]: Status[]
-}
-
-export interface HeaderProps {
-  search: string
-  setSearch: React.Dispatch<React.SetStateAction<string>>
-}
-
-export interface HeaderMenuProps {
-  isSelectAllChecked: boolean
-  setIsSelectAllChecked: React.Dispatch<React.SetStateAction<boolean>>
-  configs: Status[]
-  selectedConfigs: Status[]
-  initiatePortForwarding: (configs: Status[]) => void
-  startSelectedPortForwarding: () => void
-  stopAllPortForwarding: () => void
-  isInitiating: boolean
-  isStopping: boolean
-  toggleExpandAll: () => void
-  expandedIndices: number[]
-  configsByContext: ConfigsByContext
-  setSelectedConfigs: React.Dispatch<React.SetStateAction<Status[]>>
-}
-
-export interface BulkDeleteButtonProps {
-  selectedConfigs: Status[]
-  setSelectedConfigs: React.Dispatch<React.SetStateAction<Status[]>>
-  configs: Status[]
-  setConfigs: React.Dispatch<React.SetStateAction<Status[]>>
-}
-
-export interface ContextsAccordionProps {
-  context: string
-  contextConfigs: Status[]
-  selectedConfigs: Status[]
-  handleDeleteConfig: (id: number) => void
-  confirmDeleteConfig: () => void
-  handleEditConfig: (id: number) => void
-  isAlertOpen: boolean
-  setIsAlertOpen: (isOpen: boolean) => void
-  updateConfigRunningState: (id: number, isRunning: boolean) => void
-  handleSelectionChange: (config: Status, isSelected: boolean) => void
-  updateSelectionState: (id: number, isRunning: boolean) => void
-  selectedConfigsByContext: Record<string, boolean>
-  handleCheckboxChange: (context: string, isChecked: boolean) => void
-  isInitiating: boolean
-  setIsInitiating: React.Dispatch<React.SetStateAction<boolean>>
-  isStopping: boolean
+export interface StringOption {
+  label: string
+  value: string
 }

@@ -1,0 +1,12 @@
+# shellcheck disable=SC2148
+FROM opensuse/tumbleweed@sha256:d531cce8158ef9485bcd9defb061cca27b772d796343ab1d66583de6adc38f11
+
+RUN zypper refresh && \
+    zypper addrepo https://download.opensuse.org/repositories/openSUSE:Tools/openSUSE_Tumbleweed/openSUSE:Tools.repo && \
+    zypper --gpg-auto-import-keys refresh && \
+    zypper install -y osc build git curl wget jq libxml2-tools tar gzip xz coreutils && \
+    zypper clean -a
+
+WORKDIR /workspace
+
+CMD ["/bin/bash"]

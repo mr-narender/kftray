@@ -1,0 +1,2531 @@
+use std::sync::Arc;
+
+use httparse::Request;
+use k8s_openapi::api::core::v1::Pod;
+use kftray_commons::utils::config_state::set_connection_error_with_mode;
+use kftray_commons::utils::db_mode::DatabaseMode;
+use kftray_telemetry::Phase;
+use kube::Api;
+use kube_portforward::PodSelector;
+use tokio::io::{
+    AsyncRead,
+    AsyncReadExt,
+    AsyncWrite,
+    AsyncWriteExt,
+    ReadBuf,
+};
+use tokio::net::{
+    TcpListener,
+    TcpStream,
+};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tracing::{
+    debug,
+    error,
+    info,
+};
+
+use crate::kube::client::cluster_identity;
+use crate::kube::http_log_watcher::HttpLogStateWatcher;
+use crate::kube::models::Target;
+use crate::kube::shared_client::{
+    SHARED_CLIENT_MANAGER,
+    ServiceClientKey,
+};
+use crate::kube::tcp_forwarder::TcpForwarder;
+use crate::kube::udp_forwarder::UdpForwarder;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Tcp,
+    Udp,
+}
+
+#[derive(Clone)]
+pub struct ListenerConfig {
+    pub local_address: String,
+    pub local_port: u16,
+    pub protocol: Protocol,
+    pub tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    pub state_mode: Option<DatabaseMode>,
+}
+
+impl std::fmt::Debug for ListenerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ListenerConfig")
+            .field("local_address", &self.local_address)
+            .field("local_port", &self.local_port)
+            .field("protocol", &self.protocol)
+            .field("tls_acceptor", &self.tls_acceptor.is_some())
+            .field("state_mode", &self.state_mode)
+            .finish()
+    }
+}
+
+impl Default for ListenerConfig {
+    fn default() -> Self {
+        Self {
+            local_address: "127.0.0.1".to_owned(),
+            local_port: 0,
+            protocol: Protocol::Tcp,
+            tls_acceptor: None,
+            state_mode: None,
+        }
+    }
+}
+
+/// Saves on the forward's state row why a new connection could not reach the
+/// pod, and clears it once a later connection does.
+struct ConnectionErrors {
+    config_id: i64,
+    mode: Option<DatabaseMode>,
+    /// Set when a failure is reported, so a good connection only takes the
+    /// lock when there can be an error to clear.
+    saved: std::sync::atomic::AtomicBool,
+    /// Numbers each reported outcome in the order connections finished.
+    next: std::sync::atomic::AtomicU64,
+    /// The number of the last outcome written. Held across each write, so an
+    /// older outcome that reaches the lock late does not overwrite a newer one.
+    written: tokio::sync::Mutex<u64>,
+}
+
+impl ConnectionErrors {
+    fn new(config_id: i64, mode: Option<DatabaseMode>) -> Self {
+        Self {
+            config_id,
+            mode,
+            saved: std::sync::atomic::AtomicBool::new(false),
+            next: std::sync::atomic::AtomicU64::new(1),
+            written: tokio::sync::Mutex::new(0),
+        }
+    }
+
+    async fn failed(&self, message: String) {
+        let Some(mode) = self.mode else {
+            return;
+        };
+        self.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        let outcome = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut written = self.written.lock().await;
+        if outcome < *written {
+            return;
+        }
+        *written = outcome;
+        if let Err(e) = set_connection_error_with_mode(self.config_id, Some(&message), mode).await {
+            debug!(
+                "Could not save the connection error for config {}: {e}",
+                self.config_id
+            );
+        }
+        self.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn succeeded(&self) {
+        let Some(mode) = self.mode else {
+            return;
+        };
+        if !self.saved.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let outcome = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut written = self.written.lock().await;
+        if outcome < *written || !self.saved.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        *written = outcome;
+        if let Err(e) = set_connection_error_with_mode(self.config_id, None, mode).await {
+            self.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+            debug!(
+                "Could not clear the connection error for config {}: {e}",
+                self.config_id
+            );
+        }
+    }
+}
+
+/// A target whose port is given by name, and the last number resolved for the
+/// pod it was resolved against.
+struct NamedPort {
+    target: Target,
+    pod_api: Api<Pod>,
+    /// The pod a number was last read from, and that number. The identity
+    /// carries the UID: a StatefulSet replacement reuses the pod name while its
+    /// spec, and so the number a port name maps to, can differ.
+    resolved: Arc<std::sync::Mutex<Option<(kube_portforward::ReadyPod, u16)>>>,
+}
+
+/// Concurrent upstream streams a single forward may hold open, shared by
+/// its TCP and UDP paths. The permit rides with each stream for its whole
+/// lifetime (see `PermitStream`), so this bounds concurrent *open*
+/// connections rather than just concurrent creations — raised well above
+/// the pre-refactor `portforward_semaphore` creation-only limit of 50 to
+/// leave headroom for keep-alive HTTP, gRPC, websockets, and UDP peers
+/// that each pin a permit for the life of the connection.
+const MAX_CONCURRENT_STREAMS: usize = 512;
+const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long the startup probe lets the pod watcher wait for a ready pod. The
+/// probe's own `STARTUP_TIMEOUT` has to be what ends the wait: a wait with the
+/// same length can end in the same timer tick, and reports "no ready pods"
+/// without the stage and the reason the timeout carries.
+const READINESS_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+pub struct PortForwarder {
+    namespace: Arc<str>,
+    forwarder: Arc<kube_portforward::Forwarder>,
+    target_port: u16,
+    /// Set for a target whose port is given by name. The number can change when
+    /// a rollout replaces the pod, so it is re-resolved for the pod actually
+    /// selected rather than pinned at startup.
+    named_port: Option<NamedPort>,
+    /// The API server the forward was built against. Retained so cleanup can
+    /// tell whether the context still means the same server.
+    cluster_url: http::Uri,
+    /// Canonicalized identity of `cluster_url`, computed once here so every
+    /// caller comparing or keying on the destination agrees with
+    /// `cluster_identity()` in `client::mod` (which disagrees with
+    /// `Uri::to_string()` on IPv6 hosts and default ports).
+    cluster_identity: Arc<str>,
+    http_log_watcher: HttpLogStateWatcher,
+    /// Bounds concurrent open upstream streams (TCP and UDP share it); a
+    /// permit is held for as long as a stream returned by [`get_stream`]
+    /// stays open, not just for its creation.
+    ///
+    /// [`get_stream`]: Self::get_stream
+    stream_semaphore: Arc<tokio::sync::Semaphore>,
+    background_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    connection_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Set once shutdown has drained the registries, so a connection accepted
+    /// afterwards is aborted rather than tracked by nobody.
+    workers_closed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// An upstream stream paired with the semaphore permit that bounds it.
+///
+/// The permit is held for as long as the stream stays open (dropped together
+/// with it), so the semaphore it came from bounds concurrent open streams
+/// rather than just concurrent stream creations.
+pub struct PermitStream {
+    stream: kube_portforward::Stream,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl AsyncRead for PermitStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for PermitStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+    }
+}
+
+/// Marks a `PortForwarder::get_stream` failure caused by the
+/// concurrent-stream semaphore timing out rather than by the upstream
+/// connection itself, so callers can treat sustained load (back-pressure)
+/// separately from a genuinely broken relay when deciding whether to
+/// escalate to recovery.
+#[derive(Debug)]
+struct StreamPermitExhausted;
+
+impl std::fmt::Display for StreamPermitExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "No free concurrent-stream slot became available in time")
+    }
+}
+
+impl std::error::Error for StreamPermitExhausted {}
+
+/// Whether `error` (or anything in its source chain) is a
+/// `StreamPermitExhausted` marker, i.e. `get_stream` timed out waiting for
+/// a semaphore permit rather than failing to open the upstream stream.
+fn is_permit_exhausted(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<StreamPermitExhausted>())
+}
+
+/// The step of the startup probe in progress, so a timeout says which step ran
+/// out of time instead of one message for all of them.
+#[derive(Clone, Copy)]
+enum StartupStage {
+    Resolving,
+    AwaitingReadyPod,
+    OpeningConnection,
+}
+
+impl StartupStage {
+    fn timeout_message(self) -> &'static str {
+        match self {
+            Self::Resolving => "Port-forward startup timed out",
+            Self::AwaitingReadyPod => "Timed out waiting for a ready pod",
+            Self::OpeningConnection => "Timed out opening the first connection to the pod",
+        }
+    }
+}
+
+/// The current [`StartupStage`], readable after the probe future is dropped.
+/// Atomic because the future must stay `Send`.
+struct StartupProgress(std::sync::atomic::AtomicU8);
+
+impl StartupProgress {
+    fn new() -> Self {
+        Self(std::sync::atomic::AtomicU8::new(
+            StartupStage::Resolving as u8,
+        ))
+    }
+
+    fn set(&self, stage: StartupStage) {
+        self.0
+            .store(stage as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn get(&self) -> StartupStage {
+        match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            x if x == StartupStage::AwaitingReadyPod as u8 => StartupStage::AwaitingReadyPod,
+            x if x == StartupStage::OpeningConnection as u8 => StartupStage::OpeningConnection,
+            _ => StartupStage::Resolving,
+        }
+    }
+}
+
+/// The message of a startup that ran out of time. A timeout while waiting for
+/// a pod says why the selected pods are not ready, which the timeout alone
+/// leaves the user to dig out of the cluster.
+async fn startup_timeout_error(
+    elapsed: tokio::time::error::Elapsed, stage: StartupStage,
+    forwarder: &kube_portforward::Forwarder, pod_api: &Api<Pod>, selector: &PodSelector,
+) -> anyhow::Error {
+    // A named port is resolved in the first stage, and that waits for the
+    // pod too: with none ready, readiness is what ran out of time.
+    let stage = match stage {
+        StartupStage::Resolving if forwarder.ready_pod().is_none() => {
+            StartupStage::AwaitingReadyPod
+        }
+        stage => stage,
+    };
+    let mut message = stage.timeout_message().to_string();
+    if matches!(stage, StartupStage::AwaitingReadyPod)
+        && let Some(reason) = crate::kube::pod_status::explain_unready_pods(pod_api, selector).await
+    {
+        message = format!("{message}: {reason}");
+    }
+    anyhow::Error::new(elapsed).context(message)
+}
+
+/// Turns a refused port-forward upgrade into a message that says what to do:
+/// the dependency's text names an HTTP status, which reads as an internal
+/// failure when it is really the cluster rejecting this user. The original
+/// error stays in the chain.
+fn connect_failure(error: kube_portforward::Error) -> anyhow::Error {
+    let message = match &error {
+        kube_portforward::Error::UpgradeFailed {
+            status: Some(401), ..
+        } => "The cluster rejected the credentials for the port-forward connection (HTTP 401 \
+              Unauthorized): check the kubeconfig user"
+            .to_string(),
+        kube_portforward::Error::UpgradeFailed {
+            status: Some(403), ..
+        } => "The cluster refused the port-forward connection (HTTP 403 Forbidden): check RBAC \
+              for pods/portforward"
+            .to_string(),
+        kube_portforward::Error::UpgradeFailed { status, message } => {
+            let status = status.map_or_else(String::new, |status| format!(" (HTTP {status})"));
+            format!(
+                "The cluster could not open a port-forward stream to the pod{status}: {message}"
+            )
+        }
+        _ => return error.into(),
+    };
+    anyhow::Error::from(error).context(message)
+}
+
+/// The failure of a connection opened on a pod whose named port was resolved.
+/// A refused upgrade is reported as such; anything else only says the stream
+/// could not be opened.
+fn named_port_failure(error: kube_portforward::Error) -> anyhow::Error {
+    match error {
+        error @ kube_portforward::Error::UpgradeFailed { .. } => connect_failure(error),
+        error => anyhow::Error::from(error).context("Could not open a stream for the named port"),
+    }
+}
+
+async fn probe_startup(
+    forwarder: &kube_portforward::Forwarder, pod_api: &Api<Pod>, selector: &PodSelector,
+    target: &Target,
+) -> anyhow::Result<u16> {
+    let stage = StartupProgress::new();
+    let startup = async {
+        // Resolution and the probe have to agree on the pod for the same
+        // reason a later connection does: a rollout in between can map the
+        // name to a different number, and probing the old one would reject
+        // a startup the replacement would have served.
+        let mut last_error = None;
+        for _ in 0..3 {
+            stage.set(StartupStage::Resolving);
+            let (port, pod) = crate::kube::target::resolve_target_port_for_pod(
+                forwarder,
+                pod_api,
+                target,
+                READINESS_WAIT,
+            )
+            .await?;
+            // Initial readiness shares the startup deadline instead of the
+            // dependency's shorter wait for an individual connection.
+            stage.set(StartupStage::AwaitingReadyPod);
+            forwarder
+                .wait_for_ready_pod(READINESS_WAIT)
+                .await
+                .ok_or_else(|| anyhow::anyhow!(crate::kube::target::NO_READY_PODS_ERROR))?;
+            stage.set(StartupStage::OpeningConnection);
+            let connected = match forwarder.connect_on_pod(port).await {
+                Ok(connected) => connected,
+                // A number resolved on the pod that is going away can be
+                // invalid on its replacement. Resolving again reads the
+                // replacement's own mapping, so this is retried rather than
+                // rejecting a startup the new pod would serve.
+                Err(error) if pod.is_some() => {
+                    debug!("Re-resolving the named port after a failed probe: {error}");
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(connect_failure(error)),
+            };
+            let (stream, connected_pod) = connected;
+            drop(stream);
+            if pod.is_none_or(|pod| pod == connected_pod) {
+                return Ok::<_, anyhow::Error>(port);
+            }
+        }
+
+        Err(match last_error {
+            Some(error) => named_port_failure(error),
+            None => {
+                anyhow::anyhow!("The selected pod kept changing while resolving the named port")
+            }
+        })
+    };
+    let cancellation = forwarder.cancellation_token();
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(kube_portforward::Error::Cancelled.into()),
+        result = tokio::time::timeout(STARTUP_TIMEOUT, startup) => match result {
+            Ok(result) => result,
+            Err(elapsed) => Err(
+                startup_timeout_error(elapsed, stage.get(), forwarder, pod_api, selector).await,
+            ),
+        }
+    }
+}
+
+impl PortForwarder {
+    /// The API server this forward reaches.
+    pub fn cluster_url(&self) -> &http::Uri {
+        &self.cluster_url
+    }
+
+    /// Canonical string identity of the API server this forward reaches
+    /// (see `client::cluster_identity`), computed once at construction.
+    pub fn cluster_identity(&self) -> String {
+        self.cluster_identity.to_string()
+    }
+
+    pub async fn new(
+        namespace: &str, target: Target, context_name: Option<String>, kubeconfig: Option<String>,
+        pod_readiness: kube_portforward::PodReadiness, expected_destination: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let client_key = ServiceClientKey::new(context_name, kubeconfig);
+        let phase = kftray_telemetry::phase(Phase::Client);
+        let connection = SHARED_CLIENT_MANAGER
+            .get_connection(client_key)
+            .await
+            .inspect_err(|_| phase.fail())?;
+        drop(phase);
+        // The relay this forward reaches was created by an earlier step that
+        // resolved the same context; a cached client that expired in between
+        // can resolve it to another server, and forwarding there would look
+        // for a relay that is not on it, or find another installation's.
+        if let Some(expected) = expected_destination
+            && cluster_identity(&connection.cluster_url) != expected
+        {
+            anyhow::bail!(
+                "Context resolves to {} but the forward was set up against {expected}",
+                connection.cluster_url
+            );
+        }
+
+        let phase = kftray_telemetry::phase(Phase::Resolve);
+        let pod_selector =
+            crate::kube::target::resolve_pod_selector(&connection.client, namespace, &target)
+                .await
+                .inspect_err(|_| phase.fail())?;
+        let pod_api: Api<Pod> = Api::namespaced(connection.client.clone(), namespace);
+
+        let forwarder = kube_portforward::Forwarder::builder(
+            connection.client.clone(),
+            connection.cluster_url.clone(),
+            namespace,
+        )
+        .pod_selector(pod_selector.clone())
+        .pod_readiness(pod_readiness)
+        .build()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to build port forwarder: {}", e))
+        .inspect_err(|_| phase.fail())?;
+        let forwarder = Arc::new(forwarder);
+        drop(phase);
+
+        let phase = kftray_telemetry::phase(Phase::Probe);
+        let target_port = match probe_startup(&forwarder, &pod_api, &pod_selector, &target).await {
+            Ok(port) => port,
+            Err(err) => {
+                phase.fail();
+                drop(phase);
+                let _ = forwarder.shutdown().await;
+                return Err(err);
+            }
+        };
+        drop(phase);
+
+        let named_port =
+            matches!(target.port, crate::kube::models::Port::Name(_)).then(|| NamedPort {
+                target: target.clone(),
+                pod_api: pod_api.clone(),
+                resolved: Arc::new(std::sync::Mutex::new(None)),
+            });
+
+        Ok(Self {
+            namespace: namespace.into(),
+            forwarder,
+            target_port,
+            named_port,
+            cluster_url: connection.cluster_url.clone(),
+            cluster_identity: cluster_identity(&connection.cluster_url).into(),
+            http_log_watcher: HttpLogStateWatcher::new(),
+            stream_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS)),
+            background_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            workers_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    /// Any unsuccessful acquisition drops the cached mapping: a rollout can
+    /// change the number a port name maps to, and every later client would
+    /// otherwise repeat the same stale lookup.
+    fn clear_named_port_cache(&self) {
+        if let Some(named) = &self.named_port {
+            named
+                .resolved
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+        }
+    }
+
+    pub async fn get_stream(&self) -> anyhow::Result<PermitStream> {
+        const STREAM_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+        // Resolution is inside the deadline: it can perform a pod GET, and a
+        // stalled API server would otherwise hold the client past the ten
+        // seconds this promises and delay stream-failure recovery. The
+        // semaphore permit is acquired inside the same deadline and rides
+        // with the returned stream, so it bounds concurrent open streams
+        // (TCP and UDP share it) rather than just concurrent acquisitions.
+        //
+        // The permit wait and the stream creation race the same deadline
+        // through two `select!`s sharing one `sleep`, instead of a single
+        // `tokio::time::timeout` around both: that lets a timeout while
+        // still waiting on the semaphore be reported as
+        // `StreamPermitExhausted` (back-pressure from concurrent load)
+        // distinctly from a timeout during stream creation (a stalled
+        // upstream), so callers can stop sustained load from tripping the
+        // same recovery signal as a broken relay.
+        let sleep = tokio::time::sleep(STREAM_ACQUIRE_TIMEOUT);
+        tokio::pin!(sleep);
+
+        let permit = tokio::select! {
+            permit = Arc::clone(&self.stream_semaphore).acquire_owned() => {
+                permit.map_err(|_| anyhow::anyhow!("Semaphore closed"))?
+            }
+            _ = &mut sleep => {
+                self.clear_named_port_cache();
+                return Err(anyhow::Error::new(StreamPermitExhausted)
+                    .context("Timed out acquiring a port-forward stream"));
+            }
+        };
+
+        let stream = tokio::select! {
+            result = self.acquire_stream() => {
+                match result {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        self.clear_named_port_cache();
+                        return Err(error);
+                    }
+                }
+            }
+            _ = &mut sleep => {
+                self.clear_named_port_cache();
+                return Err(anyhow::anyhow!("Timed out acquiring a port-forward stream"));
+            }
+        };
+
+        Ok(PermitStream {
+            stream,
+            _permit: permit,
+        })
+    }
+
+    /// Attempts to reserve a concurrent-stream slot without waiting, so UDP
+    /// session admission can tell "no budget available" apart from "the
+    /// upstream is unreachable" before spawning a session, instead of
+    /// discovering it only after `connect` blocks for the length of
+    /// `get_stream`'s deadline.
+    pub fn try_reserve_stream(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.stream_semaphore).try_acquire_owned().ok()
+    }
+
+    /// Opens a stream using a permit already reserved via
+    /// `try_reserve_stream`, so only the stream-creation half of
+    /// `get_stream`'s deadline applies here — the semaphore wait already
+    /// happened synchronously at admission time.
+    pub async fn open_reserved_stream(
+        &self, permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> anyhow::Result<PermitStream> {
+        const STREAM_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+        match tokio::time::timeout(STREAM_OPEN_TIMEOUT, self.acquire_stream()).await {
+            Ok(Ok(stream)) => Ok(PermitStream {
+                stream,
+                _permit: permit,
+            }),
+            Ok(Err(error)) => {
+                self.clear_named_port_cache();
+                Err(error)
+            }
+            Err(_) => {
+                self.clear_named_port_cache();
+                Err(anyhow::anyhow!("Timed out acquiring a port-forward stream"))
+            }
+        }
+    }
+
+    /// Opens a stream on the pod whose port number it used.
+    ///
+    /// For a named port the two have to agree: a rollout between resolving the
+    /// name and opening the connection would otherwise send traffic to a port
+    /// number the replacement pod does not use.
+    async fn acquire_stream(&self) -> anyhow::Result<kube_portforward::Stream> {
+        const ACQUIRE_ATTEMPTS: usize = 3;
+
+        let Some(named) = &self.named_port else {
+            return self
+                .forwarder
+                .connect(self.target_port)
+                .await
+                .map_err(connect_failure);
+        };
+
+        let mut last_error = None;
+        for _ in 0..ACQUIRE_ATTEMPTS {
+            let (port, pod) = self.resolve_named_port(named).await?;
+            // A failed connection drops the mapping and resolves again rather
+            // than giving up: after a rollout the cached number belongs to the
+            // pod that is gone, and opening it on the replacement fails even
+            // though the port name is perfectly resolvable there.
+            let connected = match self.forwarder.connect_on_pod(port).await {
+                Ok(connected) => connected,
+                Err(error) => {
+                    named
+                        .resolved
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take();
+                    debug!("Re-resolving the named port after a failed connection: {error}");
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            let (stream, connected_pod) = connected;
+            if connected_pod == pod {
+                return Ok(stream);
+            }
+            // The stream reaches a pod this port number was not read from, so
+            // it is dropped rather than used: resolving again picks up the
+            // replacement's own mapping.
+            debug!(
+                "Reconnecting: resolved on {} but connected to {}",
+                pod.name, connected_pod.name
+            );
+            named
+                .resolved
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+        }
+
+        // The last connection error is the actionable one: a role without
+        // permission to open a port-forward fails every attempt, and reporting
+        // pod churn instead would hide the cause.
+        Err(match last_error {
+            Some(error) => named_port_failure(error),
+            None => {
+                anyhow::anyhow!("The selected pod kept changing while resolving the named port")
+            }
+        })
+    }
+
+    /// The port to connect to for the pod currently selected.
+    ///
+    /// A named port is re-resolved when the ready pod changes: a rollout can
+    /// map the same name to a different number, and the old one would then
+    /// reach nothing or the wrong container port.
+    async fn resolve_named_port(
+        &self, named: &NamedPort,
+    ) -> anyhow::Result<(u16, kube_portforward::ReadyPod)> {
+        if let Some((pod, port)) = named
+            .resolved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return Ok((port, pod));
+        }
+
+        let (port, resolved_pod) = crate::kube::target::resolve_target_port_for_pod(
+            &self.forwarder,
+            &named.pod_api,
+            &named.target,
+            tokio::time::Duration::from_secs(5),
+        )
+        .await?;
+        let pod = resolved_pod.ok_or_else(|| {
+            anyhow::anyhow!("A named port must resolve against a pod, but none was reported")
+        })?;
+        // Cached under the pod the number was read from, so the acquisition
+        // above can tell whether the stream it got belongs to that same pod.
+        *named.resolved.lock().unwrap_or_else(|e| e.into_inner()) = Some((pod.clone(), port));
+
+        Ok((port, pod))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handle_tcp_listener(
+        self: Arc<Self>, listener: TcpListener, config_id: i64, workload_type: String, port: u16,
+        cancellation_token: CancellationToken, tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+        state_mode: Option<DatabaseMode>,
+    ) -> anyhow::Result<()> {
+        let initial_logging_enabled =
+            match kftray_commons::utils::http_logs_config::get_http_logs_config(config_id).await {
+                Ok(config) => config.enabled,
+                Err(_) => false,
+            };
+
+        self.http_log_watcher
+            .set_http_logs(config_id, initial_logging_enabled)
+            .await?;
+
+        let http_log_watcher_clone = self.http_log_watcher.clone();
+        let sync_cancel_token = cancellation_token.clone();
+        let sync_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Err(e) = http_log_watcher_clone
+                            .sync_from_external_state(config_id)
+                            .await
+                        {
+                            debug!("Sync error for config {}: {}", config_id, e);
+                        }
+                    }
+                    _ = sync_cancel_token.cancelled() => {
+                        debug!("HTTP log sync task cancelled for config {}", config_id);
+                        break;
+                    }
+                }
+            }
+        });
+        self.track_task(sync_task);
+
+        let tcp_forwarder = TcpForwarder::new(config_id, workload_type);
+
+        let forwarder_clone = Arc::clone(&self);
+        let cancel_token = cancellation_token.clone();
+
+        let mut pod_change_rx = self.forwarder.subscribe_pod_changes();
+        let mut consecutive_accept_errors: u32 = 0;
+        const MAX_ACCEPT_ERRORS: u32 = 10;
+        const BASE_BACKOFF_MS: u64 = 10;
+        const MAX_BACKOFF_MS: u64 = 5000;
+        let consecutive_stream_failures = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        const MAX_STREAM_FAILURES: u32 = 5;
+        let connection_errors = Arc::new(ConnectionErrors::new(config_id, state_mode));
+
+        loop {
+            let (client_conn, client_addr) = tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok(connection) => {
+                            consecutive_accept_errors = 0;
+                            connection
+                        }
+                        Err(e) => {
+                            consecutive_accept_errors += 1;
+                            let exponent = consecutive_accept_errors.saturating_sub(1).min(10);
+                            let backoff_ms = std::cmp::min(
+                                BASE_BACKOFF_MS.saturating_mul(1u64 << exponent),
+                                MAX_BACKOFF_MS
+                            );
+                            error!(
+                                "Accept failed ({}/{}): {}, backing off {}ms",
+                                consecutive_accept_errors, MAX_ACCEPT_ERRORS, e, backoff_ms
+                            );
+                            if consecutive_accept_errors >= MAX_ACCEPT_ERRORS {
+                                error!(
+                                    "Too many consecutive accept errors, stopping listener for config {}",
+                                    config_id
+                                );
+                                return Err(anyhow::anyhow!(
+                                    "TCP listener failed after {} consecutive accept errors: {}",
+                                    MAX_ACCEPT_ERRORS, e
+                                ));
+                            }
+                            tokio::select! {
+                                _ = tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)) => {}
+                                _ = cancel_token.cancelled() => {
+                                    debug!("Backoff interrupted by cancellation");
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+                pod_change = pod_change_rx.recv() => {
+                    match pod_change {
+                        Ok(kube_portforward::PodChange::Died(dead_pod_name)) => {
+                            debug!(
+                                "Pod {} died reactively, signaling recovery for config {}",
+                                dead_pod_name, config_id
+                            );
+                            if let Some(rm) = crate::kube::proxy_recovery::RECOVERY_MANAGERS.get(&config_id) {
+                                rm.signal_recovery(crate::kube::proxy_recovery::RecoverySignal::PodDied);
+                            }
+                        }
+                        Ok(_) => {
+                            // A ready-pod replacement can map the named port
+                            // to a different number on the new pod; drop the
+                            // cached mapping so the next acquire re-resolves
+                            // it instead of reusing the old pod's number.
+                            if let Some(named) = &self.named_port {
+                                named
+                                    .resolved
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .take();
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            debug!("pod_change_rx lagged by {} for config {}", n, config_id);
+                            // A lagged receiver may have missed a pod
+                            // replacement event entirely; drop the cached
+                            // mapping so the next acquire re-resolves it
+                            // instead of risking a stale port number.
+                            if let Some(named) = &self.named_port {
+                                named
+                                    .resolved
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .take();
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            debug!("pod_change_rx closed for config {}", config_id);
+                        }
+                    }
+                    continue;
+                }
+                _ = cancel_token.cancelled() => {
+                    break;
+                }
+            };
+
+            let forwarder = Arc::clone(&forwarder_clone);
+            let mut tcp_forwarder = tcp_forwarder.clone();
+            let http_log_watcher_clone = Arc::new(self.http_log_watcher.clone());
+            let cancel_token_clone = cancel_token.clone();
+            let tls_acceptor_clone = tls_acceptor.clone();
+            let connection_tasks = Arc::clone(&self.connection_tasks);
+            let workers_closed = Arc::clone(&self.workers_closed);
+            let stream_failures_clone = Arc::clone(&consecutive_stream_failures);
+            let connection_errors = Arc::clone(&connection_errors);
+
+            let handle = tokio::spawn(async move {
+                let mut client_conn = client_conn;
+                let tls_acceptor_clone = match tls_acceptor_clone {
+                    Some(_) if is_http_request(&client_conn).await => {
+                        if let Err(e) = handle_http_redirect(client_conn, port).await {
+                            debug!("Failed to redirect HTTP to HTTPS: {}", e);
+                        }
+                        return;
+                    }
+                    acceptor => acceptor,
+                };
+
+                let upstream_stream = match forwarder.get_stream().await {
+                    Ok(stream) => {
+                        stream_failures_clone.store(0, std::sync::atomic::Ordering::SeqCst);
+                        connection_errors.succeeded().await;
+                        stream
+                    }
+                    Err(e) if is_permit_exhausted(&e) => {
+                        debug!("No free concurrent-stream slot for {}: {}", client_addr, e);
+                        let _ = client_conn.shutdown().await;
+                        return;
+                    }
+                    Err(e) => {
+                        let failures = stream_failures_clone
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                            + 1;
+                        if failures >= MAX_STREAM_FAILURES
+                            && let Some(rm) =
+                                crate::kube::proxy_recovery::RECOVERY_MANAGERS.get(&config_id)
+                        {
+                            rm.signal_recovery(
+                                crate::kube::proxy_recovery::RecoverySignal::StreamFailed,
+                            );
+                        }
+                        error!("Failed to create stream for {}: {}", client_addr, e);
+                        let _ = client_conn.shutdown().await;
+                        connection_errors.failed(format!("{e:#}")).await;
+                        return;
+                    }
+                };
+
+                if let Some(acceptor) = tls_acceptor_clone {
+                    match acceptor.accept(client_conn).await {
+                        Ok(tls_stream) => {
+                            if let Err(e) = tcp_forwarder
+                                .forward_tls_streams(
+                                    tls_stream,
+                                    upstream_stream,
+                                    cancel_token_clone.clone(),
+                                )
+                                .await
+                            {
+                                debug!("TLS forwarding error for {}: {}", client_addr, e);
+                            }
+                        }
+                        Err(e) => {
+                            debug!("TLS handshake failed for {}: {}", client_addr, e);
+                        }
+                    }
+                } else if let Err(e) = tcp_forwarder
+                    .forward_streams(
+                        client_conn,
+                        upstream_stream,
+                        client_addr,
+                        cancel_token_clone,
+                        Arc::clone(&http_log_watcher_clone),
+                        port,
+                    )
+                    .await
+                {
+                    debug!("TCP forwarding error for {}: {}", client_addr, e);
+                }
+            });
+
+            {
+                let mut tasks = Self::registry(&connection_tasks);
+                // Registration is closed under the same lock the final drain
+                // takes, so a connection accepted while shutdown runs is
+                // aborted instead of being left untracked.
+                if workers_closed.load(std::sync::atomic::Ordering::SeqCst) {
+                    handle.abort();
+                } else {
+                    tasks.retain(|handle| !handle.is_finished());
+                    tasks.push(handle);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn start_listener(
+        self: Arc<Self>, listener_config: ListenerConfig, config_id: i64, workload_type: String,
+        cancellation_token: CancellationToken,
+    ) -> anyhow::Result<(u16, JoinHandle<anyhow::Result<()>>)> {
+        if let Err(e) =
+            crate::network_utils::ensure_loopback_address(&listener_config.local_address).await
+        {
+            return Err(anyhow::anyhow!("Network config failed: {}", e));
+        }
+
+        match listener_config.protocol {
+            Protocol::Tcp => {
+                self.start_tcp_listener(
+                    listener_config,
+                    config_id,
+                    workload_type,
+                    cancellation_token,
+                )
+                .await
+            }
+            Protocol::Udp => {
+                self.start_udp_listener(listener_config, config_id, cancellation_token)
+                    .await
+            }
+        }
+    }
+
+    async fn start_tcp_listener(
+        self: Arc<Self>, listener_config: ListenerConfig, config_id: i64, workload_type: String,
+        cancellation_token: CancellationToken,
+    ) -> anyhow::Result<(u16, JoinHandle<anyhow::Result<()>>)> {
+        let ip = listener_config
+            .local_address
+            .parse::<std::net::IpAddr>()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Invalid IP address '{}': {}",
+                    listener_config.local_address,
+                    e
+                )
+            })?;
+        let addr = std::net::SocketAddr::new(ip, listener_config.local_port);
+
+        let listener = TcpListener::bind(addr).await.map_err(|e| match e.kind() {
+            std::io::ErrorKind::AddrInUse => {
+                crate::local_port::port_in_use(ip, addr.port(), Protocol::Tcp)
+            }
+            std::io::ErrorKind::PermissionDenied => crate::local_port::bind_denied(
+                &listener_config.local_address,
+                addr.port(),
+                Protocol::Tcp,
+            ),
+            std::io::ErrorKind::AddrNotAvailable => crate::local_port::address_unavailable(
+                &listener_config.local_address,
+                addr.port(),
+                Protocol::Tcp,
+            ),
+            _ => anyhow::anyhow!("Failed to bind TCP listener to {}: {}", addr, e),
+        })?;
+        let port = listener.local_addr()?.port();
+
+        let tls_acceptor = listener_config.tls_acceptor;
+        let state_mode = listener_config.state_mode;
+        let handle = tokio::spawn(async move {
+            self.handle_tcp_listener(
+                listener,
+                config_id,
+                workload_type,
+                port,
+                cancellation_token,
+                tls_acceptor,
+                state_mode,
+            )
+            .await
+        });
+
+        Ok((port, handle))
+    }
+
+    async fn start_udp_listener(
+        self: Arc<Self>, listener_config: ListenerConfig, config_id: i64,
+        cancellation_token: CancellationToken,
+    ) -> anyhow::Result<(u16, JoinHandle<anyhow::Result<()>>)> {
+        let signal_token = cancellation_token.clone();
+        let upstream = Arc::new(ForwarderUpstream {
+            forwarder: Arc::clone(&self),
+            failures: UdpUpstreamFailures::new(config_id),
+            errors: ConnectionErrors::new(config_id, listener_config.state_mode),
+        });
+        let (port, forward_future) = UdpForwarder::bind_and_forward(
+            listener_config.local_address,
+            listener_config.local_port,
+            upstream,
+            cancellation_token,
+        )
+        .await?;
+        let handle = spawn_udp_forward_owner(forward_future, signal_token, config_id);
+        Ok((port, handle))
+    }
+
+    pub fn get_http_log_watcher(&self) -> &HttpLogStateWatcher {
+        &self.http_log_watcher
+    }
+
+    pub async fn set_http_logging(&self, config_id: i64, enabled: bool) -> anyhow::Result<()> {
+        self.http_log_watcher
+            .set_http_logs(config_id, enabled)
+            .await
+    }
+
+    pub async fn get_http_logging(&self, config_id: i64) -> bool {
+        self.http_log_watcher.get_http_logs(config_id).await
+    }
+
+    fn track_task(&self, handle: tokio::task::JoinHandle<()>) {
+        Self::registry(&self.background_tasks).push(handle);
+    }
+
+    fn registry(
+        tasks: &Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    ) -> std::sync::MutexGuard<'_, Vec<tokio::task::JoinHandle<()>>> {
+        tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    async fn cleanup_tasks(&self, tasks: &Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>) {
+        let tasks = {
+            let mut registry = Self::registry(tasks);
+            // Closed first: an accept iteration already running would otherwise
+            // register a worker after this drain and never be joined.
+            self.workers_closed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            std::mem::take(&mut *registry)
+        };
+        for handle in &tasks {
+            handle.abort();
+        }
+        for handle in tasks {
+            let _ = handle.await;
+        }
+    }
+
+    /// Requests abortion of every worker without awaiting, so a synchronous
+    /// `Drop` can still release the sockets held by connections stalled outside
+    /// a cancellation point, such as a TLS handshake.
+    ///
+    /// The handles are kept: aborting only schedules cancellation, so
+    /// [`shutdown`](Self::shutdown) still has something to await before
+    /// reporting the workers gone.
+    pub fn abort_workers(&self) {
+        {
+            // Set under the same lock the accept loop's registration check
+            // takes, so a connection accepted concurrently either observes
+            // the flag and aborts itself, or is pushed here and aborted below.
+            let registry = Self::registry(&self.connection_tasks);
+            self.workers_closed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            for handle in registry.iter() {
+                handle.abort();
+            }
+        }
+        for handle in Self::registry(&self.background_tasks).iter() {
+            handle.abort();
+        }
+    }
+
+    pub async fn get_current_active_pod(&self) -> Option<String> {
+        match self.forwarder.ready_pod() {
+            Some(pod_name) => Some(pod_name),
+            None => {
+                if self.forwarder.has_running_pods() {
+                    Some("pending-rollout".to_string())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        info!(
+            "Shutting down port forwarder for namespace: {}",
+            self.namespace.as_ref()
+        );
+
+        self.http_log_watcher.shutdown();
+
+        self.cleanup_tasks(&self.background_tasks).await;
+        self.cleanup_tasks(&self.connection_tasks).await;
+
+        if let Err(e) = self.forwarder.shutdown().await {
+            debug!("Forwarder shutdown returned an error: {}", e);
+        }
+    }
+}
+
+/// Tracks consecutive tunnel-open failures for one config and escalates to
+/// recovery once the relay has stopped accepting new tunnels.
+struct UdpUpstreamFailures {
+    config_id: i64,
+    consecutive: std::sync::atomic::AtomicU32,
+}
+
+impl UdpUpstreamFailures {
+    const MAX: u32 = 5;
+
+    fn new(config_id: i64) -> Self {
+        Self {
+            config_id,
+            consecutive: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    fn reset(&self) {
+        self.consecutive
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn record(&self, error: &anyhow::Error) {
+        let failures = self
+            .consecutive
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        error!(
+            "Failed to open a UDP tunnel for config {}: {}",
+            self.config_id, error
+        );
+        if failures >= Self::MAX
+            && let Some(rm) = crate::kube::proxy_recovery::RECOVERY_MANAGERS.get(&self.config_id)
+        {
+            rm.signal_recovery(crate::kube::proxy_recovery::RecoverySignal::StreamFailed);
+        }
+    }
+}
+
+/// Opens a fresh port-forward stream for every local UDP client so replies
+/// cannot cross between clients sharing the listener.
+struct ForwarderUpstream {
+    forwarder: Arc<PortForwarder>,
+    failures: UdpUpstreamFailures,
+    errors: ConnectionErrors,
+}
+
+impl crate::kube::udp_forwarder::UdpUpstream for ForwarderUpstream {
+    type Stream = PermitStream;
+    type Reservation = tokio::sync::OwnedSemaphorePermit;
+
+    fn try_reserve(&self) -> Option<Self::Reservation> {
+        self.forwarder.try_reserve_stream()
+    }
+
+    async fn connect(&self, reservation: Self::Reservation) -> anyhow::Result<Self::Stream> {
+        let result = self.forwarder.open_reserved_stream(reservation).await;
+        match &result {
+            Ok(_) => self.errors.succeeded().await,
+            Err(error) => self.errors.failed(format!("{error:#}")).await,
+        }
+        result
+    }
+
+    fn on_connect_failure(&self, error: &anyhow::Error) {
+        self.failures.record(error);
+    }
+
+    fn on_session_failure(&self, error: &anyhow::Error) {
+        self.failures.record(error);
+    }
+
+    fn on_session_traffic(&self) {
+        self.failures.reset();
+    }
+}
+
+fn spawn_udp_forward_owner(
+    forward_future: impl Future<Output = anyhow::Result<()>> + Send + 'static,
+    signal_token: CancellationToken, config_id: i64,
+) -> JoinHandle<anyhow::Result<()>> {
+    tokio::spawn(async move {
+        let result = forward_future.await;
+        if !signal_token.is_cancelled()
+            && let Some(rm) = crate::kube::proxy_recovery::RECOVERY_MANAGERS.get(&config_id)
+        {
+            log::info!(
+                "UDP forwarder task completed, signaling recovery for config_id={}",
+                config_id
+            );
+            rm.signal_recovery(crate::kube::proxy_recovery::RecoverySignal::StreamFailed);
+        }
+        result
+    })
+}
+
+async fn is_http_request(client_conn: &TcpStream) -> bool {
+    let mut peek_buf = [0u8; 64];
+
+    if client_conn.peek(&mut peek_buf).await.is_ok() {
+        let mut headers = [httparse::EMPTY_HEADER; 4];
+        let mut req = Request::new(&mut headers);
+
+        matches!(
+            req.parse(&peek_buf),
+            Ok(httparse::Status::Complete(_)) | Ok(httparse::Status::Partial)
+        )
+    } else {
+        false
+    }
+}
+
+async fn handle_http_redirect(mut stream: TcpStream, port: u16) -> anyhow::Result<()> {
+    let mut buffer = [0u8; 1024];
+    let n = stream.read(&mut buffer).await?;
+
+    let request = std::str::from_utf8(&buffer[..n])?;
+    let mut lines = request.lines();
+
+    let request_line = match lines.next() {
+        Some(line) => line,
+        None => return Ok(()),
+    };
+
+    let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+
+    let host = lines
+        .find(|line| line.to_lowercase().starts_with("host:"))
+        .and_then(|line| line.split(':').nth(1))
+        .map(|h| h.trim())
+        .unwrap_or("localhost");
+
+    let response = format!(
+        "HTTP/1.1 301 Moved Permanently\r\n\
+        Location: https://{}:{}{}\r\n\
+        Content-Length: 0\r\n\
+        \r\n",
+        host, port, path
+    );
+
+    stream.write_all(response.as_bytes()).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use http::{
+        Request,
+        Response,
+    };
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    use kube::client::Body;
+    use tower_test::mock;
+
+    use super::*;
+
+    #[test]
+    fn a_startup_timeout_names_the_step_that_ran_out_of_time() {
+        use kftray_telemetry::{
+            FailureKind,
+            classify,
+        };
+
+        assert_eq!(
+            classify(StartupStage::AwaitingReadyPod.timeout_message()),
+            FailureKind::PodNotReady
+        );
+        assert_eq!(
+            classify(StartupStage::OpeningConnection.timeout_message()),
+            FailureKind::Timeout
+        );
+        assert_eq!(
+            classify(StartupStage::Resolving.timeout_message()),
+            FailureKind::Timeout
+        );
+        assert_eq!(
+            classify(crate::kube::target::NO_READY_PODS_ERROR),
+            FailureKind::PodNotReady
+        );
+    }
+
+    fn web_selector() -> PodSelector {
+        PodSelector::Labels {
+            selector: "app=web".into(),
+        }
+    }
+
+    fn restarting_selector() -> PodSelector {
+        PodSelector::Name("restarting".into())
+    }
+
+    fn ready_test_pod(name: &str) -> Pod {
+        use k8s_openapi::api::core::v1::{
+            PodCondition,
+            PodStatus,
+        };
+
+        Pod {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                uid: Some(format!("{name}-uid")),
+                resource_version: Some("1".to_string()),
+                ..Default::default()
+            },
+            status: Some(PodStatus {
+                phase: Some("Running".to_string()),
+                conditions: Some(vec![PodCondition {
+                    type_: "Ready".into(),
+                    status: "True".into(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    async fn serve_ready_pod_then_stall(
+        mut handle: mock::Handle<Request<Body>, Response<Body>>, pod_name: &str,
+        upgrade_started: Arc<tokio::sync::Notify>, ready_delay: Duration,
+    ) {
+        let (request, send) = handle
+            .next_request()
+            .await
+            .expect("expected the initial pod list request");
+        assert!(
+            request.uri().path().ends_with("/pods"),
+            "expected a pod list request, got {}",
+            request.uri()
+        );
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PodList",
+            "metadata": { "resourceVersion": "1" },
+            "items": [ready_test_pod(pod_name)],
+        });
+        let response = Response::builder()
+            .status(200)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        tokio::time::sleep(ready_delay).await;
+        send.send_response(response);
+
+        let mut held_pending = Vec::new();
+        while let Some((request, send)) = handle.next_request().await {
+            if request.uri().path().ends_with("/portforward") {
+                upgrade_started.notify_one();
+            }
+            held_pending.push(send);
+        }
+    }
+
+    async fn startup_with_recreated_pod(
+        ready_delay: Duration,
+    ) -> (
+        kube_portforward::Forwarder,
+        Api<Pod>,
+        Arc<tokio::sync::Notify>,
+        JoinHandle<()>,
+    ) {
+        use k8s_openapi::api::core::v1::{
+            Container,
+            ContainerPort,
+            PodSpec,
+        };
+
+        let (service, mut handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let client = kube::Client::new(service, "default");
+        let upgrade_started = Arc::new(tokio::sync::Notify::new());
+        let notify = Arc::clone(&upgrade_started);
+        let driver = tokio::spawn(async move {
+            let mut ready = ready_test_pod("restarting");
+            ready.spec = Some(PodSpec {
+                containers: vec![Container {
+                    name: "web".into(),
+                    ports: Some(vec![ContainerPort {
+                        name: Some("http".into()),
+                        container_port: 8080,
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            let mut pending = ready.clone();
+            pending
+                .status
+                .as_mut()
+                .unwrap()
+                .conditions
+                .as_mut()
+                .unwrap()[0]
+                .status = "False".into();
+            let (request, send) = handle.next_request().await.unwrap();
+            assert!(request.uri().path().ends_with("/pods"));
+            let list = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "PodList",
+                "metadata": { "resourceVersion": "1" },
+                "items": [pending],
+            });
+            send.send_response(Response::new(Body::from(
+                serde_json::to_vec(&list).unwrap(),
+            )));
+
+            let (request, send) = handle.next_request().await.unwrap();
+            assert!(request.uri().query().unwrap().contains("watch=true"));
+            tokio::time::sleep(ready_delay).await;
+            ready.metadata.resource_version = Some("2".into());
+            let mut event = serde_json::to_vec(&serde_json::json!({
+                "type": "MODIFIED", "object": ready,
+            }))
+            .unwrap();
+            event.push(b'\n');
+            send.send_response(Response::new(Body::from(event)));
+
+            let mut held_pending = Vec::new();
+            while let Some((request, send)) = handle.next_request().await {
+                if request.uri().path().ends_with("/pods/restarting") {
+                    send.send_response(Response::new(Body::from(
+                        serde_json::to_vec(&ready).unwrap(),
+                    )));
+                } else {
+                    if request.uri().path().ends_with("/portforward") {
+                        notify.notify_one();
+                    }
+                    held_pending.push(send);
+                }
+            }
+        });
+        let forwarder = kube_portforward::Forwarder::builder(
+            client.clone(),
+            "http://127.0.0.1:1".parse().unwrap(),
+            "default",
+        )
+        .pod_selector(kube_portforward::PodSelector::Name("restarting".into()))
+        .build()
+        .await
+        .unwrap();
+        (
+            forwarder,
+            Api::namespaced(client, "default"),
+            upgrade_started,
+            driver,
+        )
+    }
+
+    #[tokio::test]
+    async fn startup_waits_for_a_recreated_pod_before_probing() {
+        use crate::kube::models::{
+            Port,
+            TargetSelector,
+        };
+
+        tokio::time::pause();
+        for port in [Port::Number(8080), Port::Name("http".into())] {
+            let (forwarder, pods, upgrade_started, driver) =
+                startup_with_recreated_pod(Duration::from_secs(45)).await;
+            let target = Target::new(TargetSelector::PodLabel("app=web".into()), port, "default");
+            let started = tokio::time::Instant::now();
+            let selector = restarting_selector();
+            let mut startup = Box::pin(probe_startup(&forwarder, &pods, &selector, &target));
+            tokio::select! {
+                _ = upgrade_started.notified() => {}
+                result = &mut startup => panic!("startup rejected the restarting pod: {result:?}"),
+            }
+            assert!(started.elapsed() >= Duration::from_secs(45));
+            assert!(started.elapsed() < STARTUP_TIMEOUT);
+            forwarder.shutdown().await.unwrap();
+            assert!(matches!(
+                startup
+                    .await
+                    .unwrap_err()
+                    .downcast_ref::<kube_portforward::Error>(),
+                Some(kube_portforward::Error::Cancelled)
+            ));
+            driver.abort();
+            let _ = driver.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_readiness_and_upgrade_share_one_deadline() {
+        use crate::kube::models::{
+            Port,
+            TargetSelector,
+        };
+
+        tokio::time::pause();
+        for port in [Port::Number(8080), Port::Name("http".into())] {
+            let (forwarder, pods, _, driver) =
+                startup_with_recreated_pod(Duration::from_secs(45)).await;
+            let target = Target::new(TargetSelector::PodLabel("app=web".into()), port, "default");
+            let error = tokio::time::timeout(
+                STARTUP_TIMEOUT + Duration::from_millis(100),
+                probe_startup(&forwarder, &pods, &restarting_selector(), &target),
+            )
+            .await
+            .expect("readiness must not reset the startup deadline")
+            .unwrap_err();
+
+            assert!(error.is::<tokio::time::error::Elapsed>(), "{error:#}");
+            forwarder.shutdown().await.unwrap();
+            driver.abort();
+            let _ = driver.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_deadline_also_bounds_a_pod_that_never_becomes_ready() {
+        use crate::kube::models::TargetSelector;
+
+        tokio::time::pause();
+        let (forwarder, pods, _, driver) = startup_with_recreated_pod(STARTUP_TIMEOUT * 2).await;
+        let target = Target::new(TargetSelector::PodLabel("app=web".into()), 8080, "default");
+        // Reading the pod to explain the timeout is bounded and comes after it.
+        let deadline = tokio::time::Instant::now()
+            + STARTUP_TIMEOUT
+            + crate::kube::pod_status::LOOKUP_TIMEOUT
+            + Duration::from_millis(100);
+        let selector = restarting_selector();
+        let mut startup = Box::pin(probe_startup(&forwarder, &pods, &selector, &target));
+        assert!(futures::poll!(startup.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(45)).await;
+        assert!(futures::poll!(startup.as_mut()).is_pending());
+        tokio::time::timeout_at(deadline, startup)
+            .await
+            .expect("an unready pod must not extend the startup deadline")
+            .unwrap_err();
+        assert!(forwarder.ready_pod_identity().is_none());
+        forwarder.shutdown().await.unwrap();
+        driver.abort();
+        let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_startup_while_waiting_for_readiness() {
+        use crate::kube::models::{
+            Port,
+            TargetSelector,
+        };
+
+        tokio::time::pause();
+        for port in [Port::Number(8080), Port::Name("http".into())] {
+            let (forwarder, pods, _, driver) =
+                startup_with_recreated_pod(STARTUP_TIMEOUT * 2).await;
+            let target = Target::new(TargetSelector::PodLabel("app=web".into()), port, "default");
+            let selector = restarting_selector();
+            let mut startup = Box::pin(probe_startup(&forwarder, &pods, &selector, &target));
+            assert!(futures::poll!(startup.as_mut()).is_pending());
+            forwarder.shutdown().await.unwrap();
+
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_millis(100), startup)
+                    .await
+                    .expect("shutdown must interrupt the readiness wait")
+                    .unwrap_err()
+                    .downcast_ref::<kube_portforward::Error>(),
+                Some(kube_portforward::Error::Cancelled)
+            ));
+            driver.abort();
+            let _ = driver.await;
+        }
+    }
+
+    fn crash_looping_pod(name: &str) -> Pod {
+        use k8s_openapi::api::core::v1::{
+            ContainerState,
+            ContainerStateTerminated,
+            ContainerStateWaiting,
+            ContainerStatus,
+            PodCondition,
+        };
+
+        let mut pod = ready_test_pod(name);
+        let status = pod.status.as_mut().unwrap();
+        status.conditions = Some(vec![PodCondition {
+            type_: "Ready".into(),
+            status: "False".into(),
+            ..Default::default()
+        }]);
+        status.container_statuses = Some(vec![ContainerStatus {
+            name: "app".into(),
+            restart_count: 7,
+            state: Some(ContainerState {
+                waiting: Some(ContainerStateWaiting {
+                    reason: Some("CrashLoopBackOff".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            last_state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 1,
+                    reason: Some("Error".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]);
+        pod
+    }
+
+    /// Answers pod list and get requests from `pods`, and every port-forward
+    /// upgrade with `upgrade_status`. Watches are held open.
+    async fn serve_pods(
+        mut handle: mock::Handle<Request<Body>, Response<Body>>, pods: Vec<Pod>,
+        upgrade_status: u16,
+    ) {
+        let mut held = Vec::new();
+        while let Some((request, send)) = handle.next_request().await {
+            let path = request.uri().path().to_string();
+            let watching = request
+                .uri()
+                .query()
+                .is_some_and(|query| query.contains("watch=true"));
+            let named = pods.iter().find(|pod| {
+                path.ends_with(&format!("/pods/{}", pod.metadata.name.as_ref().unwrap()))
+            });
+            if path.ends_with("/portforward") {
+                send.send_response(
+                    Response::builder()
+                        .status(upgrade_status)
+                        .body(Body::empty())
+                        .unwrap(),
+                );
+            } else if path.ends_with("/pods") && !watching {
+                let list = serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "PodList",
+                    "metadata": { "resourceVersion": "1" },
+                    "items": pods,
+                });
+                send.send_response(Response::new(Body::from(
+                    serde_json::to_vec(&list).unwrap(),
+                )));
+            } else if let Some(pod) = named {
+                send.send_response(Response::new(Body::from(serde_json::to_vec(pod).unwrap())));
+            } else {
+                held.push(send);
+            }
+        }
+    }
+
+    async fn startup_against(
+        pods: Vec<Pod>, upgrade_status: u16,
+    ) -> (kube_portforward::Forwarder, Api<Pod>, JoinHandle<()>) {
+        let (service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let client = kube::Client::new(service, "default");
+        let driver = tokio::spawn(serve_pods(handle, pods, upgrade_status));
+        let forwarder = kube_portforward::Forwarder::builder(
+            client.clone(),
+            "http://127.0.0.1:1".parse().unwrap(),
+            "default",
+        )
+        .pod_selector(web_selector())
+        .build()
+        .await
+        .unwrap();
+        (forwarder, Api::namespaced(client, "default"), driver)
+    }
+
+    #[tokio::test]
+    async fn a_start_timeout_says_why_the_pod_is_not_ready() {
+        use kftray_telemetry::{
+            FailureKind,
+            classify,
+        };
+
+        use crate::kube::models::{
+            Port,
+            TargetSelector,
+        };
+
+        tokio::time::pause();
+        for port in [Port::Number(8080), Port::Name("http".into())] {
+            let (forwarder, pods, driver) =
+                startup_against(vec![crash_looping_pod("web-1")], 101).await;
+            let target = Target::new(TargetSelector::PodLabel("app=web".into()), port, "default");
+            let error = probe_startup(&forwarder, &pods, &web_selector(), &target)
+                .await
+                .unwrap_err();
+
+            let message = error.to_string();
+            assert!(
+                message.starts_with("Timed out waiting for a ready pod"),
+                "{message}"
+            );
+            assert!(message.contains("web-1"), "{message}");
+            assert!(message.contains("CrashLoopBackOff"), "{message}");
+            assert_eq!(classify(&message), FailureKind::PodNotReady);
+            assert!(error.is::<tokio::time::error::Elapsed>(), "{error:#}");
+            forwarder.shutdown().await.unwrap();
+            driver.abort();
+            let _ = driver.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_start_timeout_says_when_no_pod_matches() {
+        use crate::kube::models::TargetSelector;
+
+        tokio::time::pause();
+        let (forwarder, pods, driver) = startup_against(Vec::new(), 101).await;
+        let target = Target::new(TargetSelector::PodLabel("app=web".into()), 8080, "default");
+        let message = probe_startup(&forwarder, &pods, &web_selector(), &target)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            message.starts_with("Timed out waiting for a ready pod"),
+            "{message}"
+        );
+        assert!(message.contains("no pod matches app=web"), "{message}");
+        forwarder.shutdown().await.unwrap();
+        driver.abort();
+        let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_port_forward_upgrade_is_classified_by_its_status() {
+        use kftray_telemetry::{
+            FailureKind,
+            classify,
+        };
+
+        use crate::kube::models::TargetSelector;
+
+        tokio::time::pause();
+        for (status, kind) in [
+            (401, FailureKind::Kubeconfig),
+            (403, FailureKind::Kubeconfig),
+            (502, FailureKind::Connection),
+        ] {
+            let (forwarder, pods, driver) =
+                startup_against(vec![ready_test_pod("web-1")], status).await;
+            let target = Target::new(TargetSelector::PodLabel("app=web".into()), 8080, "default");
+            let error = probe_startup(&forwarder, &pods, &web_selector(), &target)
+                .await
+                .unwrap_err();
+
+            let message = error.to_string();
+            assert!(message.contains(&format!("HTTP {status}")), "{message}");
+            assert_eq!(classify(&message), kind, "{message}");
+            if status == 403 {
+                assert!(message.contains("pods/portforward"), "{message}");
+            }
+            assert!(
+                matches!(
+                    error.downcast_ref::<kube_portforward::Error>(),
+                    Some(kube_portforward::Error::UpgradeFailed { status: Some(code), .. })
+                        if *code == status
+                ),
+                "the dependency error must stay in the chain: {error:#}"
+            );
+            forwarder.shutdown().await.unwrap();
+            driver.abort();
+            let _ = driver.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn get_stream_preserves_the_pod_readiness_wait() {
+        tokio::time::pause();
+        let pod_name = "delayed-ready";
+        let (mock_service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let kube_client = kube::Client::new(mock_service, "default");
+        let upgrade_started = Arc::new(tokio::sync::Notify::new());
+        let driver = tokio::spawn(serve_ready_pod_then_stall(
+            handle,
+            pod_name,
+            Arc::clone(&upgrade_started),
+            Duration::from_secs(4),
+        ));
+        let forwarder = kube_portforward::Forwarder::builder(
+            kube_client,
+            "http://127.0.0.1:1".parse().unwrap(),
+            "default",
+        )
+        .pod_selector(kube_portforward::PodSelector::Name(pod_name.to_owned()))
+        .build()
+        .await
+        .unwrap();
+        let port_forwarder = PortForwarder {
+            namespace: "default".into(),
+            forwarder: Arc::new(forwarder),
+            target_port: 8080,
+            named_port: None,
+            cluster_url: "http://127.0.0.1:1".parse().unwrap(),
+            cluster_identity: "http://127.0.0.1:1".into(),
+            http_log_watcher: HttpLogStateWatcher::new(),
+            stream_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS)),
+            background_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            workers_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let mut acquisition = Box::pin(port_forwarder.get_stream());
+        tokio::select! {
+            _ = upgrade_started.notified() => {}
+            result = &mut acquisition => {
+                panic!("acquisition ended before the ready pod could start its upgrade: {:?}", result.err());
+            }
+        }
+        drop(acquisition);
+        port_forwarder.shutdown().await;
+        driver.abort();
+        let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn get_stream_times_out_when_upgrade_response_never_arrives() {
+        tokio::time::pause();
+
+        let pod_name = "web-0";
+        let (mock_service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let kube_client = kube::Client::new(mock_service, "default");
+        let cluster_url: http::Uri = "http://127.0.0.1:1".parse().unwrap();
+
+        let upgrade_started = Arc::new(tokio::sync::Notify::new());
+        let driver = tokio::spawn(serve_ready_pod_then_stall(
+            handle,
+            pod_name,
+            Arc::clone(&upgrade_started),
+            Duration::ZERO,
+        ));
+
+        let forwarder = kube_portforward::Forwarder::builder(kube_client, cluster_url, "default")
+            .pod_selector(kube_portforward::PodSelector::Name(pod_name.to_string()))
+            .pod_readiness(kube_portforward::PodReadiness::default())
+            .build()
+            .await
+            .expect("forwarder should build without contacting the apiserver");
+
+        let ready = forwarder
+            .wait_for_ready_pod(Duration::from_secs(5))
+            .await
+            .expect("pod list response should mark the pod ready");
+        assert_eq!(ready, pod_name);
+
+        let port_forwarder = PortForwarder {
+            namespace: "default".into(),
+            forwarder: Arc::new(forwarder),
+            target_port: 8080,
+            named_port: None,
+            cluster_url: "http://127.0.0.1:1".parse().unwrap(),
+            cluster_identity: "http://127.0.0.1:1".into(),
+            http_log_watcher: HttpLogStateWatcher::new(),
+            stream_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS)),
+            background_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            workers_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        let get_stream_fut = port_forwarder.get_stream();
+        tokio::pin!(get_stream_fut);
+        tokio::select! {
+            _ = upgrade_started.notified() => {}
+            _ = &mut get_stream_fut => panic!("acquisition ended before the upgrade request"),
+        }
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let result = tokio::time::timeout(Duration::from_secs(1), get_stream_fut)
+            .await
+            .expect("the acquisition deadline must complete the pending upgrade");
+        let error = match result {
+            Ok(_) => panic!("the pending upgrade unexpectedly completed"),
+            Err(error) => error,
+        };
+        assert!(
+            !is_permit_exhausted(&error),
+            "a timeout during stream creation, with the permit already held, must not be \
+             reported as permit exhaustion: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("Timed out acquiring a port-forward stream"),
+            "unexpected error: {error}"
+        );
+        port_forwarder.shutdown().await;
+        driver.abort();
+        let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn a_permit_exhaustion_timeout_is_reported_distinctly_from_a_stream_failure() {
+        tokio::time::pause();
+
+        let (mock_service, _handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let kube_client = kube::Client::new(mock_service, "default");
+        let cluster_url: http::Uri = "http://127.0.0.1:1".parse().unwrap();
+
+        let forwarder =
+            kube_portforward::Forwarder::builder(kube_client, cluster_url.clone(), "default")
+                .pod_selector(kube_portforward::PodSelector::Name("web-0".to_owned()))
+                .build()
+                .await
+                .expect("forwarder should build without contacting the apiserver");
+
+        let port_forwarder = PortForwarder {
+            namespace: "default".into(),
+            forwarder: Arc::new(forwarder),
+            target_port: 8080,
+            named_port: None,
+            cluster_url: cluster_url.clone(),
+            cluster_identity: cluster_url.to_string().into(),
+            http_log_watcher: HttpLogStateWatcher::new(),
+            stream_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            background_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            workers_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        // Hold the sole permit externally so `get_stream` blocks purely on
+        // the semaphore and never reaches the network.
+        let held_permit = port_forwarder
+            .try_reserve_stream()
+            .expect("the sole permit must be free at the start");
+
+        let mut call = Box::pin(port_forwarder.get_stream());
+        // Poll once so `get_stream`'s internal sleep is registered against
+        // the paused clock before it is advanced below.
+        tokio::select! {
+            biased;
+            result = &mut call => panic!(
+                "get_stream must not resolve before the semaphore times out: {:?}",
+                result.err().map(|e| e.to_string())
+            ),
+            _ = tokio::time::sleep(Duration::ZERO) => {}
+        }
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let error = match tokio::time::timeout(Duration::from_secs(1), &mut call)
+            .await
+            .expect("the acquisition deadline must complete")
+        {
+            Ok(_) => panic!("get_stream must fail when the semaphore never frees up"),
+            Err(error) => error,
+        };
+
+        assert!(
+            is_permit_exhausted(&error),
+            "a timeout while still waiting on the semaphore must be reported as permit \
+             exhaustion, not a generic stream failure: {error}"
+        );
+
+        drop(held_permit);
+    }
+
+    #[tokio::test]
+    async fn stream_semaphore_bounds_concurrent_acquisitions_shared_by_tcp_and_udp() {
+        use crate::kube::udp_forwarder::UdpUpstream;
+
+        tokio::time::pause();
+
+        let pod_name = "web-0";
+        let (mock_service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let kube_client = kube::Client::new(mock_service, "default");
+        let cluster_url: http::Uri = "http://127.0.0.1:1".parse().unwrap();
+
+        let upgrade_started = Arc::new(tokio::sync::Notify::new());
+        let driver = tokio::spawn(serve_ready_pod_then_stall(
+            handle,
+            pod_name,
+            Arc::clone(&upgrade_started),
+            Duration::ZERO,
+        ));
+
+        let forwarder =
+            kube_portforward::Forwarder::builder(kube_client, cluster_url.clone(), "default")
+                .pod_selector(kube_portforward::PodSelector::Name(pod_name.to_string()))
+                .pod_readiness(kube_portforward::PodReadiness::default())
+                .build()
+                .await
+                .expect("forwarder should build without contacting the apiserver");
+
+        let ready = forwarder
+            .wait_for_ready_pod(Duration::from_secs(5))
+            .await
+            .expect("pod list response should mark the pod ready");
+        assert_eq!(ready, pod_name);
+
+        let port_forwarder = Arc::new(PortForwarder {
+            namespace: "default".into(),
+            forwarder: Arc::new(forwarder),
+            target_port: 8080,
+            named_port: None,
+            cluster_url: cluster_url.clone(),
+            cluster_identity: cluster_url.to_string().into(),
+            http_log_watcher: HttpLogStateWatcher::new(),
+            stream_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            background_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            workers_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+
+        // TCP path: get_stream() takes the sole permit and then hangs on the
+        // stalled upgrade response while still holding it.
+        let tcp_forwarder = Arc::clone(&port_forwarder);
+        let mut tcp_call = Box::pin(tcp_forwarder.get_stream());
+        tokio::select! {
+            _ = upgrade_started.notified() => {}
+            result = &mut tcp_call => panic!(
+                "TCP call ended before it could reach the network: {:?}",
+                result.err()
+            ),
+        }
+
+        // UDP path shares the same `PortForwarder` field: with the sole
+        // permit held by the TCP call above, admission must be refused
+        // immediately instead of spawning a session that would only block
+        // on the semaphore.
+        let udp_upstream = ForwarderUpstream {
+            forwarder: Arc::clone(&port_forwarder),
+            failures: UdpUpstreamFailures::new(1),
+            errors: ConnectionErrors::new(1, None),
+        };
+        assert!(
+            udp_upstream.try_reserve().is_none(),
+            "UDP admission should be refused while the TCP call holds the sole permit"
+        );
+
+        // Dropping the TCP call releases its permit; UDP admission now
+        // succeeds and connect() reaches the network with it.
+        let udp_notified = upgrade_started.notified();
+        drop(tcp_call);
+        let reservation = udp_upstream
+            .try_reserve()
+            .expect("the permit released by the TCP call should be available to UDP");
+        let mut udp_call = Box::pin(udp_upstream.connect(reservation));
+        tokio::select! {
+            () = udp_notified => {}
+            result = &mut udp_call => panic!(
+                "UDP connect resolved before reaching the network: {:?}",
+                result.err()
+            ),
+        }
+
+        drop(udp_call);
+        port_forwarder.shutdown().await;
+        driver.abort();
+        let _ = driver.await;
+    }
+
+    fn recovery_receiver(
+        config_id: i64,
+    ) -> tokio::sync::broadcast::Receiver<crate::kube::proxy_recovery::RecoverySignal> {
+        let config = kftray_commons::models::config_model::Config {
+            id: Some(config_id),
+            kubeconfig: Some("/nonexistent/isolated-test-kubeconfig".to_owned()),
+            protocol: "udp".to_owned(),
+            ..Default::default()
+        };
+        let manager = Arc::new(crate::kube::proxy_recovery::ProxyRecoveryManager::new(
+            config,
+            crate::kube::proxy_recovery::ProxyType::Deployment,
+            kftray_commons::utils::db_mode::DatabaseMode::Memory,
+            false,
+            "http://127.0.0.1:1/".to_string(),
+        ));
+        let receiver = manager.subscribe_recovery_signals();
+        crate::kube::proxy_recovery::RECOVERY_MANAGERS.insert(config_id, manager);
+        receiver
+    }
+
+    #[tokio::test]
+    async fn repeated_udp_tunnel_failures_signal_recovery() {
+        let _lock = crate::port_forward::PROCESS_TEST_MUTEX.lock().await;
+        let config_id = 900_101;
+        let mut receiver = recovery_receiver(config_id);
+        let failures = UdpUpstreamFailures::new(config_id);
+
+        for _ in 1..UdpUpstreamFailures::MAX {
+            failures.record(&anyhow::anyhow!("no relay pod"));
+        }
+        let quiet = receiver.try_recv();
+        failures.record(&anyhow::anyhow!("no relay pod"));
+        let signal = receiver.try_recv();
+        crate::kube::proxy_recovery::RECOVERY_MANAGERS.remove(&config_id);
+
+        assert!(
+            matches!(
+                quiet,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "a transient tunnel failure must not trigger recovery"
+        );
+        assert_eq!(
+            signal.unwrap(),
+            crate::kube::proxy_recovery::RecoverySignal::StreamFailed
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_tunnel_clears_earlier_failures() {
+        let _lock = crate::port_forward::PROCESS_TEST_MUTEX.lock().await;
+        let config_id = 900_103;
+        let mut receiver = recovery_receiver(config_id);
+        let failures = UdpUpstreamFailures::new(config_id);
+
+        for _ in 1..UdpUpstreamFailures::MAX {
+            failures.record(&anyhow::anyhow!("no relay pod"));
+        }
+        failures.reset();
+        failures.record(&anyhow::anyhow!("no relay pod"));
+        let signal = receiver.try_recv();
+        crate::kube::proxy_recovery::RECOVERY_MANAGERS.remove(&config_id);
+
+        assert!(matches!(
+            signal,
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn udp_owner_does_not_signal_recovery_on_intentional_cancellation() {
+        let _lock = crate::port_forward::PROCESS_TEST_MUTEX.lock().await;
+        let config_id = 900_102;
+        let (upstream, _opened) = crate::kube::udp_forwarder::tests::SpawningUpstream::new(64);
+        let token = CancellationToken::new();
+        let (_, forward) =
+            UdpForwarder::bind_and_forward("127.0.0.1".to_owned(), 0, upstream, token.clone())
+                .await
+                .unwrap();
+        let mut receiver = recovery_receiver(config_id);
+        token.cancel();
+        let owner = spawn_udp_forward_owner(forward, token, config_id);
+        tokio::time::timeout(Duration::from_secs(5), owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let signal = receiver.try_recv();
+        crate::kube::proxy_recovery::RECOVERY_MANAGERS.remove(&config_id);
+        assert!(matches!(
+            signal,
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn aborting_the_udp_owner_releases_the_socket_for_immediate_rebind() {
+        let (upstream, _opened) = crate::kube::udp_forwarder::tests::SpawningUpstream::new(1024);
+        let cancellation_token = CancellationToken::new();
+
+        let (port, forward_future) = UdpForwarder::bind_and_forward(
+            "127.0.0.1".to_string(),
+            0,
+            upstream,
+            cancellation_token.clone(),
+        )
+        .await
+        .unwrap();
+
+        let owner = spawn_udp_forward_owner(forward_future, cancellation_token, 900_201);
+        owner.abort();
+        let join_result = owner.await;
+        assert!(
+            join_result.is_err() && join_result.unwrap_err().is_cancelled(),
+            "the owner task should report a cancelled join, not a normal result"
+        );
+
+        let rebound = tokio::net::UdpSocket::bind(format!("127.0.0.1:{port}")).await;
+        assert!(
+            rebound.is_ok(),
+            "rebinding the same address right after awaited cleanup should succeed: {:?}",
+            rebound.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_shuts_the_forwarder_down_when_the_listener_task_ignores_abort() {
+        let pod_name = "web-0";
+        let (mock_service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let kube_client = kube::Client::new(mock_service, "default");
+        let upgrade_started = Arc::new(tokio::sync::Notify::new());
+        let driver = tokio::spawn(serve_ready_pod_then_stall(
+            handle,
+            pod_name,
+            Arc::clone(&upgrade_started),
+            Duration::ZERO,
+        ));
+        let forwarder = kube_portforward::Forwarder::builder(
+            kube_client,
+            "http://127.0.0.1:1".parse().unwrap(),
+            "default",
+        )
+        .pod_selector(kube_portforward::PodSelector::Name(pod_name.to_owned()))
+        .build()
+        .await
+        .unwrap();
+        let port_forwarder = Arc::new(PortForwarder {
+            namespace: "default".into(),
+            forwarder: Arc::new(forwarder),
+            target_port: 8080,
+            named_port: None,
+            cluster_url: "http://127.0.0.1:1".parse().unwrap(),
+            cluster_identity: "http://127.0.0.1:1".into(),
+            http_log_watcher: HttpLogStateWatcher::new(),
+            stream_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS)),
+            background_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            workers_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        port_forwarder.track_task(tokio::spawn(std::future::pending()));
+
+        let (started, running) = tokio::sync::oneshot::channel::<()>();
+        let stubborn = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let _ = started.send(());
+            std::thread::sleep(Duration::from_secs(3));
+            Ok(())
+        });
+        // A blocking task is only immune to the abort once it has started.
+        running.await.unwrap();
+        let mut process = crate::port_forward::PortForwardProcess::with_forwarder_and_token(
+            stubborn,
+            Arc::clone(&port_forwarder),
+            "410031".to_owned(),
+            CancellationToken::new(),
+        );
+
+        let shutdown = tokio::time::timeout(Duration::from_secs(5), process.cleanup_and_abort())
+            .await
+            .expect("cleanup must not wait on a task that ignores abort");
+        assert_eq!(
+            shutdown,
+            Err(crate::port_forward::ShutdownTimedOut),
+            "a listener task that outlasts the bound is reported, not treated as released"
+        );
+
+        assert!(
+            PortForwarder::registry(&port_forwarder.background_tasks).is_empty(),
+            "the forwarder must be shut down even when the listener join times out"
+        );
+        driver.abort();
+        let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_reports_a_connection_worker_that_ignores_abort() {
+        let pod_name = "web-0";
+        let (mock_service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let driver = tokio::spawn(serve_ready_pod_then_stall(
+            handle,
+            pod_name,
+            Arc::new(tokio::sync::Notify::new()),
+            Duration::ZERO,
+        ));
+        let forwarder = kube_portforward::Forwarder::builder(
+            kube::Client::new(mock_service, "default"),
+            "http://127.0.0.1:1".parse().unwrap(),
+            "default",
+        )
+        .pod_selector(kube_portforward::PodSelector::Name(pod_name.to_owned()))
+        .build()
+        .await
+        .unwrap();
+        let port_forwarder = Arc::new(PortForwarder {
+            namespace: "default".into(),
+            forwarder: Arc::new(forwarder),
+            target_port: 8080,
+            named_port: None,
+            cluster_url: "http://127.0.0.1:1".parse().unwrap(),
+            cluster_identity: "http://127.0.0.1:1".into(),
+            http_log_watcher: HttpLogStateWatcher::new(),
+            stream_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS)),
+            background_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            workers_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        // An accepted connection keeps the local port bound for as long as its
+        // task lives, even after the listener task itself is gone. A blocking
+        // task is only immune to the abort once it has started running.
+        let (started, running) = tokio::sync::oneshot::channel::<()>();
+        let stubborn_worker = tokio::task::spawn_blocking(move || {
+            let _ = started.send(());
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        running.await.unwrap();
+        PortForwarder::registry(&port_forwarder.connection_tasks).push(stubborn_worker);
+        let mut process = crate::port_forward::PortForwardProcess::with_forwarder_and_token(
+            tokio::spawn(std::future::pending::<anyhow::Result<()>>()),
+            Arc::clone(&port_forwarder),
+            "410032".to_owned(),
+            CancellationToken::new(),
+        );
+
+        let shutdown = process.cleanup_and_abort().await;
+
+        assert_eq!(shutdown, Err(crate::port_forward::ShutdownTimedOut));
+        driver.abort();
+        let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn dropping_a_process_releases_a_connection_stalled_outside_cancellation() {
+        let pod_name = "web-0";
+        let (mock_service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let kube_client = kube::Client::new(mock_service, "default");
+        let driver = tokio::spawn(serve_ready_pod_then_stall(
+            handle,
+            pod_name,
+            Arc::new(tokio::sync::Notify::new()),
+            Duration::ZERO,
+        ));
+        let forwarder = kube_portforward::Forwarder::builder(
+            kube_client,
+            "http://127.0.0.1:1".parse().unwrap(),
+            "default",
+        )
+        .pod_selector(kube_portforward::PodSelector::Name(pod_name.to_owned()))
+        .build()
+        .await
+        .unwrap();
+        let port_forwarder = Arc::new(PortForwarder {
+            namespace: "default".into(),
+            forwarder: Arc::new(forwarder),
+            target_port: 8080,
+            named_port: None,
+            cluster_url: "http://127.0.0.1:1".parse().unwrap(),
+            cluster_identity: "http://127.0.0.1:1".into(),
+            http_log_watcher: HttpLogStateWatcher::new(),
+            stream_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS)),
+            background_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            workers_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+
+        // A client that connected and then stalled where no cancellation token
+        // is polled, holding its socket for as long as its task lives.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        drop(listener);
+        let stalled = tokio::spawn(async move {
+            let _accepted = accepted;
+            std::future::pending::<()>().await;
+        });
+        let stalled_task = stalled.abort_handle();
+        PortForwarder::registry(&port_forwarder.connection_tasks).push(stalled);
+
+        let process = crate::port_forward::PortForwardProcess::with_forwarder_and_token(
+            tokio::spawn(std::future::pending()),
+            Arc::clone(&port_forwarder),
+            "410071".to_owned(),
+            CancellationToken::new(),
+        );
+
+        drop(process);
+        tokio::task::yield_now().await;
+
+        assert!(
+            stalled_task.is_finished(),
+            "dropping an unregistered process must abort the forwarder's connection tasks"
+        );
+        drop(client);
+        driver.abort();
+        let _ = driver.await;
+    }
+
+    async fn running_config() -> i64 {
+        use kftray_commons::models::config_state_model::ConfigState;
+
+        let id = kftray_commons::utils::config::insert_config_with_mode(
+            kftray_commons::models::config_model::Config::default(),
+            DatabaseMode::Memory,
+        )
+        .await
+        .unwrap();
+        kftray_commons::utils::config_state::update_config_state_with_mode(
+            &ConfigState::new(id, true),
+            DatabaseMode::Memory,
+        )
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn last_error_of(config_id: i64) -> Option<String> {
+        kftray_commons::utils::config_state::read_config_states_with_mode(DatabaseMode::Memory)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|state| state.config_id == config_id)
+            .unwrap()
+            .last_error
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_that_cannot_open_saves_the_error_on_the_forward() {
+        use crate::kube::udp_forwarder::UdpUpstream;
+
+        let _db = kftray_commons::test_utils::test_db().await;
+        let id = running_config().await;
+        let (mock_service, _handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let cluster_url: http::Uri = "http://127.0.0.1:1".parse().unwrap();
+        let forwarder = kube_portforward::Forwarder::builder(
+            kube::Client::new(mock_service, "default"),
+            cluster_url.clone(),
+            "default",
+        )
+        .pod_selector(kube_portforward::PodSelector::Name("web-0".to_owned()))
+        .build()
+        .await
+        .unwrap();
+        let upstream = ForwarderUpstream {
+            forwarder: Arc::new(PortForwarder {
+                namespace: "default".into(),
+                forwarder: Arc::new(forwarder),
+                target_port: 0,
+                named_port: None,
+                cluster_url: cluster_url.clone(),
+                cluster_identity: cluster_url.to_string().into(),
+                http_log_watcher: HttpLogStateWatcher::new(),
+                stream_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+                background_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+                connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+                workers_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            failures: UdpUpstreamFailures::new(id),
+            errors: ConnectionErrors::new(id, Some(DatabaseMode::Memory)),
+        };
+
+        let reservation = upstream.try_reserve().unwrap();
+        let error = upstream.connect(reservation).await.err().unwrap();
+
+        assert_eq!(last_error_of(id).await, Some(format!("{error:#}")));
+        upstream.forwarder.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_good_connection_clears_the_saved_error() {
+        let _db = kftray_commons::test_utils::test_db().await;
+        let id = running_config().await;
+        let errors = ConnectionErrors::new(id, Some(DatabaseMode::Memory));
+
+        errors.failed("pod web-0 is not ready".to_owned()).await;
+        let saved = last_error_of(id).await;
+        errors.succeeded().await;
+
+        assert_eq!(saved.as_deref(), Some("pod web-0 is not ready"));
+        assert_eq!(last_error_of(id).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_failure_that_reaches_the_lock_late_keeps_the_newer_outcome() {
+        let _db = kftray_commons::test_utils::test_db().await;
+        let id = running_config().await;
+        let errors = ConnectionErrors::new(id, Some(DatabaseMode::Memory));
+        *errors.written.lock().await = 2;
+
+        errors.failed("pod web-0 is not ready".to_owned()).await;
+
+        assert_eq!(last_error_of(id).await, None);
+    }
+}

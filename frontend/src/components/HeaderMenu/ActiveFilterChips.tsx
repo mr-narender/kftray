@@ -1,0 +1,102 @@
+import { X } from 'lucide-react'
+
+import { chakra, Flex, Text } from '@chakra-ui/react'
+
+import {
+  fieldLabel,
+  isTagField,
+  toggleFilterAny,
+  toggleFilterValue,
+} from '@/components/PortForwardTable/viewUtils'
+import type { ConfigView, ViewCondition } from '@/types'
+
+interface ActiveFilterChipsProps {
+  view: ConfigView
+  setView: (view: ConfigView) => void
+}
+
+interface FilterChip {
+  field: string
+  value: string | null
+}
+
+const chips = (filters: ViewCondition[]): FilterChip[] =>
+  filters.flatMap<FilterChip>(({ field, values }) =>
+    values.length
+      ? values.map(value => ({ field, value }))
+      : [{ field, value: null }],
+  )
+
+const chipLabel = ({ field, value }: FilterChip) => {
+  const name = isTagField(field) ? field.slice(4) : fieldLabel(field)
+
+  return value === null
+    ? { name: 'has', value: name }
+    : { name: `${name}:`, value }
+}
+
+export function ActiveFilterChips({ view, setView }: ActiveFilterChipsProps) {
+  if (view.filters.length === 0) {
+    return null
+  }
+
+  const setFilters = (filters: ViewCondition[]) => setView({ ...view, filters })
+  const remove = ({ field, value }: FilterChip) =>
+    setFilters(
+      value === null
+        ? toggleFilterAny(view.filters, field)
+        : toggleFilterValue(view.filters, field, value),
+    )
+
+  return (
+    <Flex wrap='wrap' align='center' gap={1} ps={3.5} pe={2.5} pt={0.5} pb={2}>
+      {chips(view.filters).map(chip => {
+        const label = chipLabel(chip)
+
+        return (
+          <Flex
+            key={`${chip.field}=${chip.value ?? ''}`}
+            align='center'
+            gap={1}
+            h='18px'
+            ps={1.5}
+            pe={0.5}
+            borderRadius='sm'
+            bg='accent.subtle'
+            border='1px solid'
+            borderColor='accent.muted'
+            fontSize='10px'
+            lineHeight='1'
+          >
+            <Text as='span' color='fg.subtle'>
+              {label.name}
+            </Text>
+            <Text as='span' color='accent.fg' truncate maxW='120px'>
+              {label.value}
+            </Text>
+            <chakra.button
+              type='button'
+              aria-label={`Remove filter ${label.name} ${label.value}`}
+              display='inline-flex'
+              alignItems='center'
+              justifyContent='center'
+              w='14px'
+              h='14px'
+              borderRadius='sm'
+              color='fg.subtle'
+              cursor='pointer'
+              _hover={{ bg: 'accent.muted', color: 'fg' }}
+              _focusVisible={{
+                outline: '1px solid',
+                outlineColor: 'accent.focusRing',
+              }}
+              onClick={() => remove(chip)}
+            >
+              <X size={9} />
+            </chakra.button>
+          </Flex>
+        )
+      })}
+    </Flex>
+  )
+}

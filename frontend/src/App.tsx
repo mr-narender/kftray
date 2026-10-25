@@ -1,18 +1,10 @@
-import React from 'react'
+import { Main } from '@/components/Main'
+import { GitSyncProvider } from '@/contexts/GitSyncContext'
 
-import { ChakraProvider } from '@chakra-ui/react'
-
-import theme from './assets/theme'
-import Main from './components/Main'
-
-import './assets/style.css'
-
-const App: React.FC = () => {
+export function App() {
   return (
-    <ChakraProvider theme={theme}>
+    <GitSyncProvider>
       <Main />
-    </ChakraProvider>
+    </GitSyncProvider>
   )
 }
-
-export default App

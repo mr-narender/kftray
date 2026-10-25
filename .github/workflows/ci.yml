@@ -1,0 +1,382 @@
+name: PR
+
+on:
+  workflow_dispatch:
+
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  frontend-lint:
+    name: Biome
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Perform linting
+        run: pnpm --filter @kftray/ui run lint:check
+
+      - name: Run tests
+        run: pnpm --filter @kftray/ui run test
+
+  rust-format:
+    name: rustfmt
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust nightly
+        run: rustup toolchain install nightly --profile minimal --component rustfmt --no-self-update
+
+      - name: Run rustfmt
+        run: cargo +nightly fmt --all -- --check
+
+  rust-lint:
+    name: Clippy
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            os_name: linux
+            rust_target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            os_name: macos
+            rust_target: aarch64-apple-darwin
+          - os: windows-latest
+            os_name: windows
+            rust_target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        if: matrix.os_name == 'linux'
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt install -y \
+              build-essential \
+              curl \
+              wget \
+              file \
+              libxdo-dev \
+              libssl-dev \
+              libayatana-appindicator3-dev \
+              librsvg2-dev \
+              libwebkit2gtk-4.1-dev \
+              patchelf \
+              xdg-utils
+
+      - name: Install Rust stable
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --target "$RUST_TARGET" --no-self-update
+          rustup default stable
+
+      - name: Set up Perl on Windows
+        if: matrix.os == 'windows-latest'
+        uses: shogo82148/actions-setup-perl@8b574cdc2dffdae49f803204a4f2b716a2fa1db7 # v1.44.2
+        with:
+          perl-version: "5.42"
+          distribution: "strawberry"
+
+      - name: Set Perl environment variables
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          echo "PERL=$((where.exe perl)[0])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          echo "OPENSSL_SRC_PERL=$((where.exe perl)[0])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: rust-lint-${{ matrix.os }}-${{ matrix.rust_target }}
+          shared-key: deps-lint-${{ matrix.rust_target }}
+          workspaces: |
+            .
+            crates/kftray-helper
+          cache-on-failure: false
+
+      - name: build kftray-helper
+        run: cargo build --bin kftray-helper --release
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  rust-coverage:
+    name: Code Coverage
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write # Codecov OIDC upload, replaces the long-lived CODECOV_TOKEN
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt install -y \
+              build-essential \
+              curl \
+              wget \
+              file \
+              libxdo-dev \
+              libssl-dev \
+              libayatana-appindicator3-dev \
+              librsvg2-dev \
+              libwebkit2gtk-4.1-dev \
+              patchelf \
+              xdg-utils
+
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools --no-self-update
+          rustup default stable
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Install nextest
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-nextest
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: rust-coverage-ci-${{ runner.os }}
+          shared-key: deps-coverage-ci
+          cache-directories: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          cache-on-failure: false
+
+      - name: Install cargo-insta
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-insta@1.49.0
+
+      - name: Run tests
+        run: cargo build --bin kftray-helper --release && INSTA_UPDATE=1 cargo llvm-cov nextest --profile ci --config-file .cargo/nextest.toml --locked --workspace --all-features --lib --bins --examples --tests --lcov --output-path lcov.info
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          use_oidc: ${{ !github.event.pull_request.head.repo.fork }}
+          files: lcov.info
+          slug: hcavarsan/kftray
+
+      - name: Upload test results
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        if: ${{ !cancelled() }}
+        with:
+          use_oidc: ${{ !github.event.pull_request.head.repo.fork }}
+          files: target/nextest/ci/junit.xml
+          slug: hcavarsan/kftray
+          report_type: test_results
+
+  e2e:
+    name: E2E (Linux)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write # Codecov OIDC upload of the e2e coverage and test results
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+          cache: "pnpm"
+
+      - name: Install system dependencies
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get install -y \
+              build-essential \
+              curl \
+              wget \
+              file \
+              libxdo-dev \
+              libssl-dev \
+              libayatana-appindicator3-dev \
+              librsvg2-dev \
+              libwebkit2gtk-4.1-dev \
+              patchelf \
+              xdg-utils \
+              xvfb
+
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools --no-self-update
+          rustup default stable
+
+      - name: Install nextest and cargo-llvm-cov
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-nextest,cargo-llvm-cov
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: e2e-${{ runner.os }}
+          shared-key: deps-e2e-${{ runner.os }}
+          workspaces: |
+            .
+            crates/kftray-helper
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run e2e
+        run: cargo run -p kftray-e2e -- run --coverage
+
+      - name: Upload e2e coverage
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          use_oidc: ${{ !github.event.pull_request.head.repo.fork }}
+          files: target/e2e/artifacts/lcov.info
+          flags: e2e
+          slug: hcavarsan/kftray
+
+      - name: Upload e2e test results
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        if: ${{ !cancelled() }}
+        with:
+          use_oidc: ${{ !github.event.pull_request.head.repo.fork }}
+          files: target/nextest/e2e/junit.xml
+          flags: e2e
+          slug: hcavarsan/kftray
+          report_type: test_results
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-artifacts-linux
+          path: |
+            target/e2e/artifacts
+            target/nextest/e2e/junit.xml
+          if-no-files-found: ignore
+
+  frontend-bundle-analysis:
+    name: Bundle Analysis
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write # Codecov OIDC bundle upload, replaces the long-lived CODECOV_TOKEN
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend with bundle analysis
+        env:
+          CODECOV_BUNDLE_ANALYSIS: "true"
+          CODECOV_OIDC: ${{ !github.event.pull_request.head.repo.fork }}
+        run: pnpm --filter @kftray/ui run build
+
+  build-and-push-docker:
+    name: Docker image
+    if: ${{ contains(github.event.pull_request.title, '[docker]') }}
+    permissions:
+      contents: read
+      packages: write # push the preview kftray-server image to GHCR
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          platforms: linux/amd64,linux/arm64
+          context: .
+          file: ./crates/kftray-server/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/kftray-server:${{ github.sha }}

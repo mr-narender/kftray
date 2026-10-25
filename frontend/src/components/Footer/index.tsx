@@ -1,177 +1,128 @@
-import React, { useState } from 'react'
-import { FaGithub } from 'react-icons/fa'
-import { MdAdd, MdFileDownload, MdFileUpload, MdSettings } from 'react-icons/md'
+import { GitBranch, Keyboard, Plus, Settings } from 'lucide-react'
 
-import { HamburgerIcon } from '@chakra-ui/icons'
-import {
-  Box,
-  Button,
-  Flex,
-  HStack,
-  IconButton,
-  Menu,
-  MenuButton,
-  MenuItem,
-  MenuList,
-  Tooltip,
-  useColorModeValue,
-} from '@chakra-ui/react'
-import { invoke } from '@tauri-apps/api/tauri'
+import { Box, Group } from '@chakra-ui/react'
 
-import { FooterProps } from '../../types'
+import { BulkDeleteButton } from '@/components/Footer/BulkDeleteButton'
+import { FooterActionButton } from '@/components/Footer/FooterActionButton'
+import { FooterMenu } from '@/components/Footer/FooterMenu'
+import { SyncConfigsButton } from '@/components/Footer/SyncConfigsButton'
+import { Tooltip } from '@/components/ui/tooltip'
+import { useGitSync } from '@/contexts/GitSyncContext'
+import type { Config } from '@/types'
 
-import BulkDeleteButton from './BulkDeleteButton'
-import SyncConfigsButton from './SyncConfigsButton'
-
-const Footer: React.FC<FooterProps> = ({
-  openModal,
-  openGitSyncModal,
-  handleExportConfigs,
-  handleImportConfigs,
-  onConfigsSynced,
-  credentialsSaved,
-  setCredentialsSaved,
-  isGitSyncModalOpen,
-  setPollingInterval,
-  pollingInterval,
-  selectedConfigs,
-  setSelectedConfigs,
-  configs,
-  setConfigs,
-}) => {
-  const borderColor = useColorModeValue('gray.500', 'gray.700')
-  const [logSize, setLogSize] = useState<number>(0)
-  const [fetchError, setFetchError] = useState<boolean>(false)
-
-  const fetchLogSize = async () => {
-    try {
-      const size = await invoke<number>('get_http_log_size')
-
-      setLogSize(size)
-      setFetchError(false)
-    } catch (error) {
-      console.error('Failed to fetch log size:', error)
-      setFetchError(true)
-    }
-  }
-
-  const handleClearLogs = async () => {
-    try {
-      await invoke('clear_http_logs')
-      setLogSize(0)
-    } catch (error) {
-      console.error('Failed to clear logs:', error)
-    }
-  }
-
-  return (
-    <Flex
-      as='footer'
-      direction='row'
-      justifyContent='space-between'
-      wrap='wrap'
-      bg='gray.800'
-      boxShadow='0px 0px 8px 3px rgba(0, 0, 0, 0.2)'
-      borderRadius='lg'
-      border='1px'
-      borderColor={borderColor}
-      width='100%'
-      padding='0.3rem'
-    >
-      <Flex justifyContent='flex-start'>
-        <Menu placement='top-end'>
-          <MenuButton
-            as={IconButton}
-            aria-label='Options'
-            icon={<HamburgerIcon />}
-            size='sm'
-            colorScheme='facebook'
-            variant='outline'
-            borderColor={borderColor}
-            onClick={fetchLogSize}
-          />
-          <MenuList zIndex='popover' fontSize='sm' minW='150px'>
-            <MenuItem icon={<MdFileUpload />} onClick={handleExportConfigs}>
-              Export Local File
-            </MenuItem>
-            <MenuItem
-              icon={<MdFileDownload />}
-              isDisabled={credentialsSaved}
-              onClick={handleImportConfigs}
-            >
-              Import Local File
-            </MenuItem>
-            <MenuItem
-              icon={<MdSettings />}
-              onClick={handleClearLogs}
-              isDisabled={logSize === 0 || fetchError}
-            >
-              Prune Logs ({(logSize / (1024 * 1024)).toFixed(2)} MB)
-            </MenuItem>
-          </MenuList>
-        </Menu>
-        <Tooltip
-          label='Add New Config'
-          placement='top'
-          fontSize='sm'
-          lineHeight='tight'
-        >
-          <IconButton
-            variant='outline'
-            icon={<MdAdd />}
-            colorScheme='facebook'
-            onClick={openModal}
-            isDisabled={credentialsSaved}
-            size='sm'
-            ml={2}
-            aria-label='Add New Config'
-            borderColor={borderColor}
-          />
-        </Tooltip>
-        <BulkDeleteButton
-          setSelectedConfigs={setSelectedConfigs}
-          selectedConfigs={selectedConfigs}
-          configs={configs}
-          setConfigs={setConfigs}
-        />
-      </Flex>
-
-      <Flex flexGrow={1} justifyContent='flex-end' alignItems='center'>
-        <Tooltip
-          label='Configure Git Sync'
-          placement='top'
-          fontSize='sm'
-          lineHeight='tight'
-        >
-          <Button
-            variant='outline'
-            colorScheme='facebook'
-            onClick={openGitSyncModal}
-            size='sm'
-            aria-label='Sync Configs'
-            borderColor='gray.700'
-            mr={2}
-          >
-            <HStack spacing={1}>
-              <Box as={FaGithub} />
-              <MdSettings />
-            </HStack>
-          </Button>
-        </Tooltip>
-        <SyncConfigsButton
-          serviceName='kftray'
-          accountName='github_config'
-          onConfigsSynced={onConfigsSynced}
-          onSyncFailure={error => console.error('Sync failed:', error)}
-          credentialsSaved={credentialsSaved}
-          setCredentialsSaved={setCredentialsSaved}
-          isGitSyncModalOpen={isGitSyncModalOpen}
-          setPollingInterval={setPollingInterval}
-          pollingInterval={pollingInterval}
-        />
-      </Flex>
-    </Flex>
-  )
+interface FooterProps {
+  selectedConfigs: Config[]
+  deleteConfigs: (ids: number[]) => Promise<boolean>
+  onAddConfig: () => void
+  onImportConfigs: () => void
+  onExportConfigs: () => void
+  onOpenGitSync: () => void
+  onOpenAutoImport: () => void
+  onOpenShortcuts: () => void
+  onOpenSettings: () => void
+  onOpenHelper: () => void
+  onOpenServerResources: () => void
 }
 
-export default Footer
+export function Footer({
+  selectedConfigs,
+  deleteConfigs,
+  onAddConfig,
+  onImportConfigs,
+  onExportConfigs,
+  onOpenGitSync,
+  onOpenAutoImport,
+  onOpenShortcuts,
+  onOpenSettings,
+  onOpenHelper,
+  onOpenServerResources,
+}: FooterProps) {
+  const { credentials } = useGitSync()
+
+  return (
+    <Box
+      display='flex'
+      alignItems='center'
+      justifyContent='space-between'
+      width='100%'
+      bg='bg.surface'
+      px={3}
+      py={2}
+      borderRadius='lg'
+      border='1px solid'
+      borderColor='border'
+      position='relative'
+      mt='-1px'
+      height='50px'
+    >
+      <Group display='flex' alignItems='center' gap={2}>
+        <FooterMenu
+          onImportConfigs={onImportConfigs}
+          onExportConfigs={onExportConfigs}
+          onOpenAutoImport={onOpenAutoImport}
+          onOpenServerResources={onOpenServerResources}
+          onOpenSettings={onOpenSettings}
+          onOpenHelper={onOpenHelper}
+        />
+
+        <Tooltip
+          content='Add New Config'
+          positioning={{
+            placement: 'top-end',
+            offset: { mainAxis: 8, crossAxis: 0 },
+          }}
+        >
+          <FooterActionButton
+            data-testid='add-config-button'
+            aria-label='Add new config'
+            onClick={onAddConfig}
+            disabled={!!credentials}
+          >
+            <Box as={Plus} width='12px' height='12px' />
+          </FooterActionButton>
+        </Tooltip>
+
+        <BulkDeleteButton
+          selectedConfigs={selectedConfigs}
+          deleteConfigs={deleteConfigs}
+        />
+      </Group>
+
+      <Group display='flex' alignItems='center' gap={2}>
+        <Tooltip
+          content='Manage Global Shortcuts'
+          positioning={{
+            placement: 'top-end',
+            offset: { mainAxis: 8, crossAxis: 0 },
+          }}
+        >
+          <FooterActionButton
+            aria-label='Manage global shortcuts'
+            onClick={onOpenShortcuts}
+          >
+            <Box as={Keyboard} width='14px' height='14px' />
+          </FooterActionButton>
+        </Tooltip>
+
+        <Tooltip
+          content='Configure Git Sync'
+          positioning={{
+            placement: 'top-end',
+            offset: { mainAxis: 8, crossAxis: 0 },
+          }}
+        >
+          <FooterActionButton
+            aria-label='Configure git sync'
+            onClick={onOpenGitSync}
+          >
+            <Box display='flex' alignItems='center' gap={1}>
+              <Box as={GitBranch} width='14px' height='14px' />
+              <Box as={Settings} width='14px' height='14px' />
+            </Box>
+          </FooterActionButton>
+        </Tooltip>
+        <SyncConfigsButton />
+      </Group>
+    </Box>
+  )
+}

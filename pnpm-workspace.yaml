@@ -1,2 +1,17 @@
 packages:
-  - 'frontend'
+  - frontend
+
+minimumReleaseAge: 1440
+
+allowBuilds:
+  # downloads the sentry-cli binary used to inject debug ids into the bundle
+  '@sentry/cli': true
+  oxc-resolver: true
+
+overrides:
+  '@codecov/vite-plugin>vite': ^8.0.3
+  undici: ^8.11.2
+
+peerDependencyRules:
+  allowedVersions:
+    '@codecov/vite-plugin>vite': '8'

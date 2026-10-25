@@ -1,93 +1,87 @@
 {
-  "build": {
-    "beforeBuildCommand": "pnpm build",
-    "beforeDevCommand": "pnpm dev",
-    "devPath": "http://localhost:1420",
-    "distDir": "../../frontend/dist",
-    "withGlobalTauri": true
-  },
-  "package": {
-    "productName": "kftray",
-    "version": "0.11.7"
-  },
-  "tauri": {
-    "allowlist": {
-      "all": true,
-      "shell": {
-        "all": false,
-        "open": true
-      }
-    },
-    "bundle": {
-      "active": true,
-      "category": "DeveloperTool",
-      "deb": {
-        "depends": []
-      },
-      "externalBin": [],
-      "icon": [
-        "icons/32x32.png",
-        "icons/128x128.png",
-        "icons/128x128@2x.png",
-        "icons/icon.icns",
-        "icons/icon.ico"
-      ],
-      "identifier": "com.hcavarsan.kftray",
-      "resources": [],
-      "shortDescription": "",
-      "targets": [
-        "app",
-        "dmg",
-        "appimage",
-        "deb",
-        "updater",
-        "msi",
-        "nsis"
-      ],
-      "windows": {
-        "certificateThumbprint": null,
-        "digestAlgorithm": "sha256",
-        "timestampUrl": ""
-      },
-      "macOS": {
-        "entitlements": "./entitlements.plist",
-        "exceptionDomain": "",
-        "frameworks": [],
-        "providerShortName": null,
-        "signingIdentity": null
-      }
-    },
+  "app": {
     "macOSPrivateApi": true,
     "security": {
       "csp": null
     },
-    "systemTray": {
-      "iconAsTemplate": false,
-      "iconPath": "icons/tray.png",
-      "menuOnLeftClick": false
+    "windows": [
+      {
+        "decorations": false,
+        "focus": true,
+        "fullscreen": false,
+        "height": 500,
+        "hiddenTitle": true,
+        "resizable": true,
+        "skipTaskbar": true,
+        "title": "kftray",
+        "transparent": true,
+        "useHttpsScheme": true,
+        "visible": false,
+        "width": 450
+      }
+    ],
+    "withGlobalTauri": true
+  },
+  "build": {
+    "beforeBuildCommand": "pnpm build",
+    "beforeBundleCommand": "node frontend/scripts/debug-files.mjs kftray",
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../../frontend/dist",
+    "removeUnusedCommands": true
+  },
+  "bundle": {
+    "active": true,
+    "category": "DeveloperTool",
+    "createUpdaterArtifacts": true,
+    "externalBin": [
+      "bin/kftray-helper"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "linux": {
+      "deb": {
+        "depends": []
+      }
     },
+    "longDescription": "kftray is a cross-platform system tray app for managing multiple Kubernetes port-forwards from a single, persistent UI.",
+    "macOS": {
+      "entitlements": "./entitlements.plist",
+      "exceptionDomain": "",
+      "frameworks": [],
+      "providerShortName": null,
+      "signingIdentity": null
+    },
+    "resources": [],
+    "shortDescription": "Kubernetes port-forward manager",
+    "targets": [
+      "app",
+      "dmg",
+      "appimage",
+      "msi",
+      "nsis"
+    ],
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": ""
+    }
+  },
+  "identifier": "com.hcavarsan.kftray",
+  "mainBinaryName": "kftray",
+  "plugins": {
     "updater": {
-      "active": true,
-      "dialog": true,
       "endpoints": [
         "https://github.com/hcavarsan/kftray/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZEMEYxNzA4ODFFNjA3RTgKUldUb0IrYUJDQmNQYmRrZFFUTUN0T3lseStZVmc5YlR4YmxtaHBoanJYeGxSMWFQbjhtTFpERGsK"
-    },
-    "windows": [
-      {
-        "decorations": false,
-        "focus": false,
-        "fullscreen": false,
-        "height": 500,
-        "hiddenTitle": true,
-        "resizable": false,
-        "skipTaskbar": true,
-        "title": "menubar",
-        "transparent": true,
-        "visible": false,
-        "width": 450
-      }
-    ]
-  }
+    }
+  },
+  "productName": "kftray",
+  "version": "0.33.0"
 }

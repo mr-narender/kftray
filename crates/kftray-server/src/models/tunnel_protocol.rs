@@ -1,0 +1,149 @@
+use serde::{
+    Deserialize,
+    Serialize,
+};
+
+/// Bytes one side may send on one stream before the peer returns
+/// `StreamCredit`. Each direction of each stream has its own budget.
+pub const STREAM_WINDOW: usize = 256 * 1024;
+
+/// The app connects the tunnel on this path when the expose carries raw TCP.
+/// The relay then pipes every connection on its HTTP port as a stream.
+pub const TCP_MODE_PATH: &str = "/tcp";
+
+/// The relay answers the TCP mode handshake with this header set to `tcp`.
+/// An app that does not see it talks to a relay without TCP support.
+pub const TUNNEL_MODE_HEADER: &str = "x-kftray-tunnel-mode";
+
+/// The app sends this header in the tunnel handshake, and a relay that can
+/// carry `StreamEnd` echoes it. Without it on both sides, EOF from either
+/// end closes the whole stream.
+pub const HALF_CLOSE_HEADER: &str = "x-kftray-half-close";
+
+/// Messages sent over WebSocket tunnel
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum TunnelMessage {
+    HttpRequest {
+        id: String,
+        method: String,
+        path: String,
+        #[serde(with = "header_pairs")]
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        /// Set by a relay that can carry an upgraded connection. A peer
+        /// that predates it never sees the flag and keeps the old path.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        upgrade: bool,
+        /// Set with `upgrade` by a relay that sends and honors
+        /// `StreamCredit`. Without it the app does not upgrade.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        flow_control: bool,
+    },
+    HttpResponse {
+        id: String,
+        status: u16,
+        #[serde(with = "header_pairs")]
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        upgraded: bool,
+        /// Set with `upgraded` by an app that sends and honors
+        /// `StreamCredit`. Without it the relay answers 502.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        flow_control: bool,
+    },
+    /// Sent by a relay in TCP mode for each new connection. The app opens
+    /// its own connection to the local port and answers `StreamClose` when
+    /// that fails.
+    StreamOpen {
+        id: String,
+    },
+    StreamData {
+        id: String,
+        data: Vec<u8>,
+    },
+    StreamClose {
+        id: String,
+    },
+    /// The sender read EOF from its end of the stream and sends no more
+    /// `StreamData` on it. The receiver shuts down writes to its end after
+    /// the queued data, and the other direction keeps flowing.
+    StreamEnd {
+        id: String,
+    },
+    /// The receiver of `StreamData` sends this after it wrote `bytes` of
+    /// it to the destination. The sender may then send `bytes` more, so
+    /// bytes sent and not yet written stay within `STREAM_WINDOW`.
+    StreamCredit {
+        id: String,
+        bytes: usize,
+    },
+    Ping,
+    Pong,
+    Error {
+        id: Option<String>,
+        message: String,
+    },
+}
+
+/// Headers go on the wire as a JSON object with one entry per value, so a
+/// repeated name repeats the key. Peers that still read headers into a map
+/// parse the message and keep the last value.
+mod header_pairs {
+    use std::fmt;
+
+    use serde::de::{
+        MapAccess,
+        Visitor,
+    };
+    use serde::ser::SerializeMap;
+    use serde::{
+        Deserializer,
+        Serializer,
+    };
+
+    pub fn serialize<S: Serializer>(
+        headers: &[(String, String)], serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(headers.len()))?;
+        for (name, value) in headers {
+            map.serialize_entry(name, value)?;
+        }
+        map.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<(String, String)>, D::Error> {
+        struct PairsVisitor;
+
+        impl<'de> Visitor<'de> for PairsVisitor {
+            type Value = Vec<(String, String)>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a map of header names to values")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut headers = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some(entry) = map.next_entry()? {
+                    headers.push(entry);
+                }
+                Ok(headers)
+            }
+        }
+
+        deserializer.deserialize_map(PairsVisitor)
+    }
+}
+
+impl TunnelMessage {
+    pub fn serialize(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(self)
+    }
+
+    pub fn deserialize(data: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(data)
+    }
+}

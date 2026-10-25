@@ -1,7 +1,39 @@
 {
 	"$schema": "https://docs.renovatebot.com/renovate-schema.json",
+	"minimumReleaseAge": "1 day",
+	"internalChecksFilter": "strict",
+	"customManagers": [
+		{
+			"customType": "regex",
+			"managerFilePatterns": ["/^\\.mise\\.toml$/"],
+			"matchStrings": [
+				"syft\\s*=\\s*\"(?<currentValue>[^\"]+)\""
+			],
+			"depNameTemplate": "anchore/syft",
+			"datasourceTemplate": "github-releases",
+			"versioningTemplate": "semver"
+		},
+		{
+			"customType": "regex",
+			"managerFilePatterns": ["/^\\.mise\\.toml$/"],
+			"matchStrings": [
+				"grype\\s*=\\s*\"(?<currentValue>[^\"]+)\""
+			],
+			"depNameTemplate": "anchore/grype",
+			"datasourceTemplate": "github-releases",
+			"versioningTemplate": "semver"
+		},
+		{
+			"customType": "regex",
+			"managerFilePatterns": ["/^\\.github/workflows/obs-publishing\\.yml$/"],
+			"matchStrings": [
+				"image:\\s*(?<depName>[a-z0-9./-]+):(?<currentValue>[a-z0-9.-]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+			],
+			"datasourceTemplate": "docker"
+		}
+	],
 	"extends": [
-		"config:base",
+		"config:recommended",
 		":preserveSemverRanges",
 		":semanticCommitTypeAll(chore)",
 		"schedule:daily",
@@ -21,19 +53,51 @@
 		"automerge": false
 	},
 	"dependencyDashboard": false,
-	"packageRules": [{
-		"matchPackagePatterns": [
-			"*"
-		],
-		"matchUpdateTypes": [
-			"minor",
-			"patch"
-		],
-		"groupName": "all non-major dependencies",
-		"groupSlug": "all-minor-patch"
-	},
-	{
-		"matchPackageNames": ["kube", "k8s-openapi", "kube-runtime", "eslint", "hyper"],
-		"enabled": false
-	}]
+	"packageRules": [
+		{
+			"matchPackageNames": ["*"],
+			"matchUpdateTypes": [
+				"minor",
+				"patch"
+			],
+			"groupName": "all non-major dependencies",
+			"groupSlug": "all-minor-patch"
+		},
+		{
+			"matchManagers": ["github-actions"],
+			"matchUpdateTypes": ["digest", "patch", "minor", "major"],
+			"groupName": "GitHub Actions",
+			"groupSlug": "github-actions"
+		},
+		{
+			"matchManagers": ["github-actions"],
+			"matchPackageNames": ["/ubuntu/"],
+			"enabled": false
+		},
+		{
+			"description": "Package build images must match hacks/obs/distros.conf, so only refresh digests",
+			"matchFileNames": [".github/workflows/obs-publishing.yml"],
+			"matchDatasources": ["docker"],
+			"matchUpdateTypes": ["major", "minor", "patch"],
+			"enabled": false
+		},
+		{
+			"matchPackageNames": [
+				"kube",
+				"k8s-openapi",
+				"kube-runtime",
+				"hyper",
+				"tauri",
+				"tauri-plugin-positioner",
+				"tauri-build",
+				"@tauri-apps/cli",
+				"@tauri-apps/api",
+				"ratatui",
+				"tui-logger",
+				"ratatui-explorer",
+				"crossterm"
+			],
+			"enabled": false
+		}
+	]
 }

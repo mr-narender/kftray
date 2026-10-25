@@ -1,0 +1,694 @@
+use std::path::{
+    Path,
+    PathBuf,
+};
+
+use anyhow::{
+    Context,
+    Result,
+};
+use kftray_commons::config_dir::get_kubeconfig_paths;
+use kube::config::{
+    Config,
+    KubeConfigOptions,
+    Kubeconfig,
+};
+use log::{
+    error,
+    info,
+};
+use openssl::base64::{
+    decode_block,
+    encode_block,
+};
+use secrecy::ExposeSecret;
+
+use super::utils::{
+    convert_pkcs8_to_pkcs1,
+    is_pkcs8_key,
+};
+
+pub trait ConfigExtClone {
+    fn clone_with_invalid_certs(&self, accept_invalid_certs: bool) -> Self;
+}
+
+impl ConfigExtClone for Config {
+    fn clone_with_invalid_certs(&self, accept_invalid_certs: bool) -> Self {
+        let mut config = self.clone();
+        config.accept_invalid_certs = accept_invalid_certs;
+        config
+    }
+}
+
+pub fn get_kubeconfig_paths_from_option(kubeconfig: Option<String>) -> Result<Vec<PathBuf>> {
+    match kubeconfig {
+        Some(path) if path == "default" => {
+            info!("Using default kubeconfig paths.");
+            get_kubeconfig_paths()
+        }
+        Some(path) => {
+            info!("Using provided kubeconfig paths: {path}");
+            let mut paths = Vec::new();
+            for entry in path.split(if cfg!(windows) { ';' } else { ':' }) {
+                let entry = PathBuf::from(entry);
+                if entry.is_dir() {
+                    paths.extend(kubeconfig_files_in(&entry)?);
+                } else {
+                    paths.push(entry);
+                }
+            }
+            Ok(paths)
+        }
+        None => {
+            info!("No kubeconfig path provided, using default paths.");
+            get_kubeconfig_paths()
+        }
+    }
+}
+
+fn kubeconfig_files_in(folder: &Path) -> Result<Vec<PathBuf>> {
+    let read_error = || format!("Failed to read kubeconfig folder {}", folder.display());
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(folder).with_context(read_error)? {
+        let path = entry.with_context(read_error)?.path();
+        if path.is_file() {
+            files.push(path);
+        }
+    }
+    if files.is_empty() {
+        anyhow::bail!("Kubeconfig folder {} has no files", folder.display());
+    }
+    files.sort();
+    Ok(files)
+}
+
+pub fn merge_kubeconfigs(paths: &[PathBuf]) -> Result<(Kubeconfig, Vec<String>)> {
+    let mut errors = Vec::new();
+    let mut merged_kubeconfig = Kubeconfig::default();
+
+    for path in paths {
+        info!("Attempting to read kubeconfig from path: {path:?}");
+        match Kubeconfig::read_from(path) {
+            Ok(kubeconfig) => {
+                info!("Successfully read kubeconfig from {path:?}");
+                match merged_kubeconfig.clone().merge(kubeconfig) {
+                    Ok(merged) => merged_kubeconfig = merged,
+                    Err(e) => {
+                        let error_msg = format!("Failed to merge kubeconfig from {path:?}: {e}");
+                        error!("{error_msg}");
+                        errors.push(error_msg);
+                    }
+                }
+            }
+            Err(e) => {
+                let error_msg = format!("Failed to read kubeconfig from {path:?}: {e}");
+                error!("{error_msg}");
+                errors.push(error_msg);
+            }
+        }
+    }
+
+    Ok((merged_kubeconfig, errors))
+}
+
+pub async fn create_config_with_context(
+    kubeconfig: &Kubeconfig, context_name: &str,
+) -> Result<Config> {
+    info!("Creating configuration for context: {context_name}");
+    let mut kubeconfig = kubeconfig.clone();
+
+    let context_to_use = if context_name == "@current" {
+        kubeconfig.current_context.clone()
+    } else {
+        Some(context_name.to_owned())
+    };
+
+    // Only the selected context's user is converted, so a bad key on an unrelated user
+    // cannot reject a context that never uses it.
+    let selected_user = context_to_use.as_deref().and_then(|name| {
+        kubeconfig
+            .contexts
+            .iter()
+            .find(|c| c.name == name)
+            .and_then(|c| c.context.as_ref())
+            .and_then(|c| c.user.clone())
+    });
+
+    for auth_info in &mut kubeconfig.auth_infos {
+        if selected_user.as_deref() != Some(auth_info.name.as_str()) {
+            continue;
+        }
+        if let Some(auth_info_data) = &mut auth_info.auth_info
+            && let Some(client_key_data) = &auth_info_data.client_key_data
+        {
+            let decoded_key = decode_block(client_key_data.expose_secret())
+                .context("Failed to decode client key data")?;
+
+            if is_pkcs8_key(&decoded_key)
+                && let Some(converted_key) = convert_pkcs8_to_pkcs1(&decoded_key)
+                    .context("Failed to convert PKCS#8 key to PKCS#1")?
+            {
+                let encoded_key = encode_block(&converted_key);
+                auth_info_data.client_key_data = Some(encoded_key.into());
+            }
+        }
+    }
+
+    Config::from_custom_kubeconfig(
+        kubeconfig,
+        &KubeConfigOptions {
+            context: context_to_use,
+            ..Default::default()
+        },
+    )
+    .await
+    .context("Failed to create configuration from kubeconfig")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kube::operations::list_contexts;
+
+    #[test]
+    fn test_get_kubeconfig_paths_from_option() {
+        use std::env;
+        use std::fs;
+        use std::sync::Mutex;
+
+        use tempfile::TempDir;
+
+        lazy_static::lazy_static! {
+            static ref ENV_LOCK: Mutex<()> = Mutex::new(());
+        }
+        let _env_guard = ENV_LOCK.lock().unwrap();
+
+        let original_kubeconfig = env::var("KUBECONFIG").ok();
+        let original_home = env::var("HOME").ok();
+
+        let temp_dir = TempDir::new().unwrap();
+
+        // Test platform-specific path separator (';' on Windows, ':' on Unix)
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        let test_paths = if cfg!(windows) {
+            format!("C:\\path1{separator}D:\\path2")
+        } else {
+            format!("/path1{separator}/path2")
+        };
+        let explicit_paths = get_kubeconfig_paths_from_option(Some(test_paths.clone())).unwrap();
+        assert_eq!(explicit_paths.len(), 2);
+        if cfg!(windows) {
+            assert_eq!(explicit_paths[0], std::path::Path::new("C:\\path1"));
+            assert_eq!(explicit_paths[1], std::path::Path::new("D:\\path2"));
+        } else {
+            assert_eq!(explicit_paths[0], std::path::Path::new("/path1"));
+            assert_eq!(explicit_paths[1], std::path::Path::new("/path2"));
+        }
+
+        let mock_kubeconfig_path = temp_dir.path().join("mock_kubeconfig");
+        fs::write(&mock_kubeconfig_path, "mock kubeconfig content").unwrap();
+
+        unsafe { env::set_var("KUBECONFIG", mock_kubeconfig_path.to_str().unwrap()) };
+
+        let default_path_result = get_kubeconfig_paths_from_option(Some("default".to_string()));
+        assert!(default_path_result.is_ok());
+        let default_path = default_path_result.unwrap();
+        assert!(!default_path.is_empty());
+        assert_eq!(default_path[0], mock_kubeconfig_path);
+
+        let none_path_result = get_kubeconfig_paths_from_option(None);
+        assert!(none_path_result.is_ok());
+        let none_path = none_path_result.unwrap();
+        assert!(!none_path.is_empty());
+        assert_eq!(none_path[0], mock_kubeconfig_path);
+
+        let fake_home = temp_dir.path().join("fake_home");
+        fs::create_dir_all(fake_home.join(".kube")).unwrap();
+        let fake_kubeconfig = fake_home.join(".kube").join("config");
+        fs::write(&fake_kubeconfig, "home dir kubeconfig content").unwrap();
+
+        unsafe { env::remove_var("KUBECONFIG") };
+
+        unsafe { env::set_var("HOME", fake_home.to_str().unwrap()) };
+
+        let home_fallback_result = get_kubeconfig_paths_from_option(None);
+        assert!(home_fallback_result.is_ok());
+        let home_fallback_path = home_fallback_result.unwrap();
+        assert!(!home_fallback_path.is_empty());
+        assert_eq!(home_fallback_path[0], fake_kubeconfig);
+
+        let nonexistent_dir = temp_dir.path().join("nonexistent");
+
+        unsafe { env::set_var("HOME", nonexistent_dir.to_str().unwrap()) };
+
+        unsafe {
+            env::set_var(
+                "KUBECONFIG",
+                temp_dir.path().join("nonexistent_file").to_str().unwrap(),
+            )
+        };
+
+        let error_result = get_kubeconfig_paths_from_option(None);
+        assert!(error_result.is_err());
+
+        match original_kubeconfig {
+            Some(val) => unsafe { env::set_var("KUBECONFIG", val) },
+            None => unsafe { env::remove_var("KUBECONFIG") },
+        }
+
+        match original_home {
+            Some(val) => unsafe { env::set_var("HOME", val) },
+            None => unsafe { env::remove_var("HOME") },
+        }
+    }
+
+    #[test]
+    fn test_merge_kubeconfigs_empty() {
+        let (config, errors) = merge_kubeconfigs(&[]).unwrap();
+        assert!(list_contexts(&config).is_empty());
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_merge_kubeconfigs_with_invalid_path() {
+        let paths = vec![PathBuf::from("/invalid/path/that/should/not/exist")];
+        let (config, errors) = merge_kubeconfigs(&paths).unwrap();
+        assert!(list_contexts(&config).is_empty());
+        assert!(!errors.is_empty());
+    }
+
+    fn write_kubeconfig(path: &Path, context: &str) {
+        std::fs::write(
+            path,
+            format!(
+                "apiVersion: v1\nkind: Config\nclusters:\n- name: {context}\n  cluster:\n    \
+                 server: https://127.0.0.1:6443\ncontexts:\n- name: {context}\n  context:\n    \
+                 cluster: {context}\n    user: {context}\nusers:\n- name: {context}\n  user:\n    \
+                 token: t\ncurrent-context: {context}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    async fn context_names(kubeconfig: &str) -> Vec<String> {
+        crate::kube::operations::list_kube_contexts(Some(kubeconfig.to_owned()))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|context| context.name)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_kubeconfig_folder_lists_the_contexts_of_its_top_level_files() {
+        let folder = tempfile::TempDir::new().unwrap();
+        write_kubeconfig(&folder.path().join("eu-dev-1.yaml"), "eu-dev-1");
+        write_kubeconfig(&folder.path().join("us-prod"), "us-prod");
+        std::fs::write(folder.path().join(".DS_Store"), b"\0\0\0\x01Bud1\0\0\x10\0").unwrap();
+        std::fs::create_dir(folder.path().join("nested")).unwrap();
+        write_kubeconfig(&folder.path().join("nested").join("deep.yaml"), "deep");
+        let folder_path = folder.path().to_str().unwrap();
+
+        assert_eq!(context_names(folder_path).await, ["eu-dev-1", "us-prod"]);
+
+        write_kubeconfig(&folder.path().join("ap-new.yaml"), "ap-new");
+        assert_eq!(
+            context_names(folder_path).await,
+            ["ap-new", "eu-dev-1", "us-prod"]
+        );
+
+        let paths = get_kubeconfig_paths_from_option(Some(folder_path.to_owned())).unwrap();
+        let (merged, _) = merge_kubeconfigs(&paths).unwrap();
+        let config = create_config_with_context(&merged, "us-prod")
+            .await
+            .unwrap();
+        assert_eq!(config.cluster_url.to_string(), "https://127.0.0.1:6443/");
+    }
+
+    #[test]
+    fn an_empty_kubeconfig_folder_names_the_folder() {
+        let folder = tempfile::TempDir::new().unwrap();
+        let error =
+            get_kubeconfig_paths_from_option(Some(folder.path().to_str().unwrap().to_owned()))
+                .unwrap_err();
+        assert!(
+            error.to_string().contains(folder.path().to_str().unwrap()),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_list_contexts() {
+        let kubeconfig = Kubeconfig {
+            contexts: vec![
+                kube::config::NamedContext {
+                    name: "context1".to_string(),
+                    context: Some(kube::config::Context::default()),
+                    ..Default::default()
+                },
+                kube::config::NamedContext {
+                    name: "context2".to_string(),
+                    context: Some(kube::config::Context::default()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let contexts = crate::kube::operations::list_contexts(&kubeconfig);
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[0], "context1");
+        assert_eq!(contexts[1], "context2");
+    }
+
+    #[test]
+    fn test_config_ext_clone() {
+        let mut config = Config::new("https://example.com".parse().unwrap());
+        config.accept_invalid_certs = false;
+
+        let cloned_config = config.clone_with_invalid_certs(true);
+        assert!(cloned_config.accept_invalid_certs);
+
+        let cloned_config_false = config.clone_with_invalid_certs(false);
+        assert!(!cloned_config_false.accept_invalid_certs);
+    }
+
+    #[tokio::test]
+    async fn test_create_config_with_context() {
+        let mut kubeconfig = Kubeconfig::default();
+        let context_name = "test-context";
+
+        let named_context = kube::config::NamedContext {
+            name: context_name.to_string(),
+            context: Some(kube::config::Context::default()),
+            ..Default::default()
+        };
+        kubeconfig.contexts = vec![named_context];
+
+        let result = create_config_with_context(&kubeconfig, context_name).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_config_ignores_unused_non_rsa_pkcs8_key() {
+        use openssl::ec::{
+            EcGroup,
+            EcKey,
+        };
+        use openssl::nid::Nid;
+        use openssl::pkey::PKey;
+
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let ec_key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
+        let ec_key_data = encode_block(&ec_key.private_key_to_pem_pkcs8().unwrap());
+
+        let kubeconfig = Kubeconfig::from_yaml(&format!(
+            r#"
+apiVersion: v1
+kind: Config
+clusters:
+- name: test-cluster
+  cluster:
+    server: https://test-server.com
+contexts:
+- name: token-context
+  context:
+    cluster: test-cluster
+    user: token-user
+current-context: token-context
+users:
+- name: token-user
+  user:
+    token: test-token
+- name: ec-user
+  user:
+    client-key-data: {ec_key_data}
+"#
+        ))
+        .unwrap();
+
+        let result = create_config_with_context(&kubeconfig, "token-context").await;
+        assert!(result.is_ok(), "{:#}", result.unwrap_err());
+    }
+
+    fn kubeconfig_with_bad_key_on(user_with_bad_key: &str) -> Kubeconfig {
+        Kubeconfig::from_yaml(
+            r#"
+apiVersion: v1
+kind: Config
+clusters:
+- name: test-cluster
+  cluster:
+    server: https://test-server.com
+contexts:
+- name: selected-context
+  context:
+    cluster: test-cluster
+    user: selected-user
+current-context: selected-context
+users:
+- name: selected-user
+  user:
+    token: test-token
+- name: other-user
+  user:
+    token: other-token
+"#,
+        )
+        .map(|mut kubeconfig| {
+            let user = kubeconfig
+                .auth_infos
+                .iter_mut()
+                .find(|u| u.name == user_with_bad_key)
+                .and_then(|u| u.auth_info.as_mut())
+                .unwrap();
+            user.client_key_data = Some("%%not-base64%%".to_string().into());
+            kubeconfig
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_create_config_ignores_invalid_key_on_unselected_user() {
+        let kubeconfig = kubeconfig_with_bad_key_on("other-user");
+
+        let result = create_config_with_context(&kubeconfig, "selected-context").await;
+        assert!(result.is_ok(), "{:#}", result.unwrap_err());
+
+        let result = create_config_with_context(&kubeconfig, "@current").await;
+        assert!(result.is_ok(), "{:#}", result.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_config_rejects_invalid_key_on_selected_user() {
+        let kubeconfig = kubeconfig_with_bad_key_on("selected-user");
+
+        let err = create_config_with_context(&kubeconfig, "selected-context")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("Failed to decode client key data"));
+    }
+
+    #[test]
+    fn test_config_ext_clone_preserves_other_fields() {
+        let mut config = Config::new("https://example.com".parse().unwrap());
+        config.accept_invalid_certs = false;
+        config.default_namespace = "test-namespace".to_string();
+        config.read_timeout = Some(std::time::Duration::from_secs(30));
+
+        let cloned_config = config.clone_with_invalid_certs(true);
+        assert!(cloned_config.accept_invalid_certs);
+        assert_eq!(
+            cloned_config.default_namespace,
+            "test-namespace".to_string()
+        );
+        assert_eq!(
+            cloned_config.read_timeout,
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(cloned_config.cluster_url, config.cluster_url);
+    }
+
+    #[tokio::test]
+    async fn test_create_config_with_insecure_skip_tls_verify_true() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let kubeconfig_path = temp_dir.path().join("kubeconfig");
+
+        let kubeconfig_content = r#"
+apiVersion: v1
+kind: Config
+clusters:
+- name: test-cluster
+  cluster:
+    server: https://test-server.com
+    insecure-skip-tls-verify: true
+contexts:
+- name: test-context
+  context:
+    cluster: test-cluster
+    user: test-user
+current-context: test-context
+users:
+- name: test-user
+  user:
+    token: test-token
+"#;
+
+        std::fs::write(&kubeconfig_path, kubeconfig_content).unwrap();
+
+        let kubeconfig = Kubeconfig::read_from(&kubeconfig_path).unwrap();
+        let config = create_config_with_context(&kubeconfig, "test-context")
+            .await
+            .unwrap();
+
+        assert!(config.accept_invalid_certs);
+    }
+
+    #[tokio::test]
+    async fn test_create_config_with_insecure_skip_tls_verify_false() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let kubeconfig_path = temp_dir.path().join("kubeconfig");
+
+        let kubeconfig_content = r#"
+apiVersion: v1
+kind: Config
+clusters:
+- name: test-cluster
+  cluster:
+    server: https://test-server.com
+    insecure-skip-tls-verify: false
+contexts:
+- name: test-context
+  context:
+    cluster: test-cluster
+    user: test-user
+current-context: test-context
+users:
+- name: test-user
+  user:
+    token: test-token
+"#;
+
+        std::fs::write(&kubeconfig_path, kubeconfig_content).unwrap();
+
+        let kubeconfig = Kubeconfig::read_from(&kubeconfig_path).unwrap();
+        let config = create_config_with_context(&kubeconfig, "test-context")
+            .await
+            .unwrap();
+
+        assert!(!config.accept_invalid_certs);
+    }
+
+    #[tokio::test]
+    async fn test_create_config_without_insecure_skip_tls_verify() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let kubeconfig_path = temp_dir.path().join("kubeconfig");
+
+        let kubeconfig_content = r#"
+apiVersion: v1
+kind: Config
+clusters:
+- name: test-cluster
+  cluster:
+    server: https://test-server.com
+contexts:
+- name: test-context
+  context:
+    cluster: test-cluster
+    user: test-user
+current-context: test-context
+users:
+- name: test-user
+  user:
+    token: test-token
+"#;
+
+        std::fs::write(&kubeconfig_path, kubeconfig_content).unwrap();
+
+        let kubeconfig = Kubeconfig::read_from(&kubeconfig_path).unwrap();
+        let config = create_config_with_context(&kubeconfig, "test-context")
+            .await
+            .unwrap();
+
+        assert!(!config.accept_invalid_certs);
+    }
+
+    #[tokio::test]
+    async fn test_merge_kubeconfigs_with_insecure_skip_tls() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let kubeconfig_path = temp_dir.path().join("kubeconfig");
+
+        let kubeconfig_content = r#"
+apiVersion: v1
+kind: Config
+clusters:
+- name: secure-cluster
+  cluster:
+    server: https://secure-server.com
+    insecure-skip-tls-verify: false
+- name: insecure-cluster
+  cluster:
+    server: https://insecure-server.com
+    insecure-skip-tls-verify: true
+contexts:
+- name: secure-context
+  context:
+    cluster: secure-cluster
+    user: test-user
+- name: insecure-context
+  context:
+    cluster: insecure-cluster
+    user: test-user
+users:
+- name: test-user
+  user:
+    token: test-token
+"#;
+
+        std::fs::write(&kubeconfig_path, kubeconfig_content).unwrap();
+
+        let (merged_kubeconfig, errors) = merge_kubeconfigs(&[kubeconfig_path]).unwrap();
+
+        let contexts = list_contexts(&merged_kubeconfig);
+        assert_eq!(contexts.len(), 2);
+        assert!(contexts.contains(&"secure-context".to_string()));
+        assert!(contexts.contains(&"insecure-context".to_string()));
+        assert!(errors.is_empty());
+
+        let insecure_cluster = merged_kubeconfig
+            .clusters
+            .iter()
+            .find(|c| c.name == "insecure-cluster")
+            .unwrap();
+        assert_eq!(
+            insecure_cluster
+                .cluster
+                .as_ref()
+                .unwrap()
+                .insecure_skip_tls_verify,
+            Some(true)
+        );
+
+        let secure_cluster = merged_kubeconfig
+            .clusters
+            .iter()
+            .find(|c| c.name == "secure-cluster")
+            .unwrap();
+        assert_eq!(
+            secure_cluster
+                .cluster
+                .as_ref()
+                .unwrap()
+                .insecure_skip_tls_verify,
+            Some(false)
+        );
+    }
+}

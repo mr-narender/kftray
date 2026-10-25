@@ -1,0 +1,79 @@
+import type { ChangeEvent } from 'react'
+import { Shield } from 'lucide-react'
+
+import { Input } from '@chakra-ui/react'
+
+import { Checkbox } from '@/components/ui/checkbox'
+
+import {
+  compactInputProps,
+  isDigitsUpTo,
+  LOAD_FAILED_NOTE,
+  SettingCard,
+  SettingRow,
+} from '../SettingCard'
+
+interface SslSettingsProps {
+  sslEnabled: boolean
+  onSslEnabledChange: (enabled: boolean) => void
+  sslCertValidityDays: string
+  onSslCertValidityDaysChange: (value: string) => void
+  disabled: boolean
+}
+
+export function SslSettings({
+  sslEnabled,
+  onSslEnabledChange,
+  sslCertValidityDays,
+  onSslCertValidityDaysChange,
+  disabled,
+}: SslSettingsProps) {
+  const handleCertValidityChange = (e: ChangeEvent<HTMLInputElement>) => {
+    const value = e.target.value
+
+    if (isDigitsUpTo(value, 3650)) {
+      onSslCertValidityDaysChange(value)
+    }
+  }
+
+  return (
+    <>
+      <SettingCard
+        title='SSL/HTTPS'
+        description='Enable HTTPS for port forwards with domain aliases. Creates SSL certificates automatically.'
+        icon={Shield}
+        iconColor='accent.fg'
+        statusColor={sslEnabled ? 'success.fg' : 'fg.subtle'}
+        statusTitle={sslEnabled ? 'Enabled' : 'Disabled'}
+        opacity={disabled ? 0.5 : undefined}
+        note={disabled ? LOAD_FAILED_NOTE : undefined}
+      >
+        <SettingRow label='Enabled:'>
+          <Checkbox
+            checked={sslEnabled}
+            onCheckedChange={e => onSslEnabledChange(e.checked === true)}
+            size='sm'
+            disabled={disabled}
+          />
+        </SettingRow>
+      </SettingCard>
+
+      <SettingCard
+        title='Certificate Validity'
+        description='Configure SSL certificate validity period. Certificates will auto-regenerate and CA will be auto-installed.'
+        opacity={sslEnabled && !disabled ? 1 : 0.5}
+      >
+        <SettingRow label='Validity (days):'>
+          <Input
+            {...compactInputProps}
+            value={sslCertValidityDays}
+            onChange={handleCertValidityChange}
+            placeholder='365'
+            width='55px'
+            disabled={!sslEnabled || disabled}
+          />
+        </SettingRow>
+      </SettingCard>
+    </>
+  )
+}
