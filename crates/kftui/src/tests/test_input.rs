@@ -1,4 +1,9 @@
-use crossterm::event::KeyCode;
+use crossterm::event::{
+    Event,
+    KeyCode,
+    KeyEvent,
+    KeyModifiers,
+};
 use kftray_commons::models::config_model::Config;
 use kftray_commons::utils::config::{
     insert_config_with_mode,
@@ -26,6 +31,7 @@ use crate::tui::input::{
     handle_help_input,
     handle_http_logs_config_input,
     handle_http_logs_viewer_input,
+    handle_input_with_reader,
     handle_logs_input,
     handle_menu_input,
     handle_normal_input,
@@ -86,6 +92,52 @@ mod tests {
         app.selected_row_stopped = 1;
         app.selected_row_running = 0;
         app
+    }
+
+    #[tokio::test]
+    async fn test_resize_returns_without_more_input_and_preserves_next_keys() {
+        for height in [40, 24, 10] {
+            let mut app = setup_app();
+            app.stopped_configs = create_test_configs(50);
+            app.update_visible_rows(24);
+            let mut events = std::collections::VecDeque::from([Event::Resize(100, height)]);
+            let mut read_event = || {
+                events
+                    .pop_front()
+                    .ok_or_else(|| std::io::Error::other("no input event available"))
+            };
+
+            assert!(
+                !handle_input_with_reader(&mut app, DatabaseMode::Memory, &mut read_event)
+                    .await
+                    .unwrap()
+            );
+            let expected_rows = height.saturating_sub(19) as usize;
+            assert_eq!(app.visible_rows, expected_rows);
+
+            let mut events = std::collections::VecDeque::from([
+                Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            ]);
+            let mut read_event = || {
+                events
+                    .pop_front()
+                    .ok_or_else(|| std::io::Error::other("no input event available"))
+            };
+            assert!(
+                !handle_input_with_reader(&mut app, DatabaseMode::Memory, &mut read_event)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(app.selected_row_stopped, 1 + expected_rows);
+            assert_eq!(app.table_state_stopped.selected(), Some(1 + expected_rows));
+            assert!(
+                handle_input_with_reader(&mut app, DatabaseMode::Memory, &mut read_event)
+                    .await
+                    .unwrap()
+            );
+            assert!(app.should_quit);
+        }
     }
 
     #[test]
@@ -704,6 +756,55 @@ mod tests {
             app.selected_config().and_then(|c| c.id),
             app.stopped_configs[row].id
         );
+    }
+
+    #[tokio::test]
+    async fn esc_from_running_table_search_starts_the_highlighted_stopped_config() {
+        let _db = kftray_commons::test_utils::test_db().await;
+        for query in ["", "alias-1", "missing"] {
+            let mut app = setup_app();
+            app.stopped_configs = create_test_configs(1);
+            app.running_configs = vec![create_test_configs(2).remove(1)];
+            app.active_component = ActiveComponent::StoppedTable;
+            app.active_table = ActiveTable::Stopped;
+            app.update_filtered_configs();
+            app.forwarding_cancel.cancel();
+
+            for key in [KeyCode::Right, KeyCode::Char('/')] {
+                handle_normal_input(&mut app, key, DatabaseMode::Memory)
+                    .await
+                    .unwrap();
+            }
+            for c in query.chars() {
+                handle_search_input(&mut app, KeyCode::Char(c)).unwrap();
+            }
+            handle_search_input(&mut app, KeyCode::Esc).unwrap();
+
+            assert_eq!(app.active_component, ActiveComponent::StoppedTable);
+            assert_eq!(app.active_table, ActiveTable::Stopped);
+            assert!(!app.search_focused);
+            assert!(app.search_query.is_empty());
+            assert_forward_and_hotkeys_target_the_highlighted_row(&app, 0);
+
+            handle_normal_input(&mut app, KeyCode::Char('f'), DatabaseMode::Memory)
+                .await
+                .unwrap();
+            while let Some(result) = app.forwarding_tasks.join_next().await {
+                result.unwrap();
+            }
+
+            assert!(app.stopped_configs.is_empty());
+            let mut running_ids: Vec<_> = app.running_configs.iter().map(|c| c.id).collect();
+            running_ids.sort();
+            assert_eq!(running_ids, [Some(0), Some(1)]);
+            assert_eq!(
+                app.configs_being_processed
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                [0]
+            );
+        }
     }
 
     #[test]
