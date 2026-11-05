@@ -77,7 +77,7 @@ impl Default for ListenerConfig {
 
 /// Saves on the forward's state row why a new connection could not reach the
 /// pod, and clears it once a later connection does.
-struct ConnectionErrors {
+pub(crate) struct ConnectionErrors {
     config_id: i64,
     mode: Option<DatabaseMode>,
     /// Set when a failure is reported, so a good connection only takes the
@@ -91,7 +91,7 @@ struct ConnectionErrors {
 }
 
 impl ConnectionErrors {
-    fn new(config_id: i64, mode: Option<DatabaseMode>) -> Self {
+    pub(crate) fn new(config_id: i64, mode: Option<DatabaseMode>) -> Self {
         Self {
             config_id,
             mode,
@@ -101,7 +101,7 @@ impl ConnectionErrors {
         }
     }
 
-    async fn failed(&self, message: String) {
+    pub(crate) async fn failed(&self, message: String) {
         let Some(mode) = self.mode else {
             return;
         };
@@ -121,7 +121,7 @@ impl ConnectionErrors {
         self.saved.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    async fn succeeded(&self) {
+    pub(crate) async fn succeeded(&self) {
         let Some(mode) = self.mode else {
             return;
         };
@@ -733,11 +733,13 @@ impl PortForwarder {
         cancellation_token: CancellationToken, tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
         state_mode: Option<DatabaseMode>,
     ) -> anyhow::Result<()> {
+        let log_mode = state_mode.unwrap_or_default();
         let initial_logging_enabled =
-            match kftray_commons::utils::http_logs_config::get_http_logs_config(config_id).await {
-                Ok(config) => config.enabled,
-                Err(_) => false,
-            };
+            kftray_commons::utils::http_logs_config::get_http_logs_config_with_mode(
+                config_id, log_mode,
+            )
+            .await
+            .is_ok_and(|config| config.enabled);
 
         self.http_log_watcher
             .set_http_logs(config_id, initial_logging_enabled)
@@ -751,7 +753,7 @@ impl PortForwarder {
                 tokio::select! {
                     _ = interval.tick() => {
                         if let Err(e) = http_log_watcher_clone
-                            .sync_from_external_state(config_id)
+                            .sync_from_external_state_with_mode(config_id, log_mode)
                             .await
                         {
                             debug!("Sync error for config {}: {}", config_id, e);
@@ -766,7 +768,7 @@ impl PortForwarder {
         });
         self.track_task(sync_task);
 
-        let tcp_forwarder = TcpForwarder::new(config_id, workload_type);
+        let tcp_forwarder = TcpForwarder::new(config_id, workload_type).with_mode(log_mode);
 
         let forwarder_clone = Arc::clone(&self);
         let cancel_token = cancellation_token.clone();
@@ -1014,22 +1016,9 @@ impl PortForwarder {
             })?;
         let addr = std::net::SocketAddr::new(ip, listener_config.local_port);
 
-        let listener = TcpListener::bind(addr).await.map_err(|e| match e.kind() {
-            std::io::ErrorKind::AddrInUse => {
-                crate::local_port::port_in_use(ip, addr.port(), Protocol::Tcp)
-            }
-            std::io::ErrorKind::PermissionDenied => crate::local_port::bind_denied(
-                &listener_config.local_address,
-                addr.port(),
-                Protocol::Tcp,
-            ),
-            std::io::ErrorKind::AddrNotAvailable => crate::local_port::address_unavailable(
-                &listener_config.local_address,
-                addr.port(),
-                Protocol::Tcp,
-            ),
-            _ => anyhow::anyhow!("Failed to bind TCP listener to {}: {}", addr, e),
-        })?;
+        let listener = crate::privileged_bind::bind_tcp_listener(addr)
+            .await
+            .map_err(|e| map_bind_error(e, &listener_config.local_address, ip, addr.port()))?;
         let port = listener.local_addr()?.port();
 
         let tls_acceptor = listener_config.tls_acceptor;
@@ -1264,7 +1253,7 @@ fn spawn_udp_forward_owner(
     })
 }
 
-async fn is_http_request(client_conn: &TcpStream) -> bool {
+pub(crate) async fn is_http_request(client_conn: &TcpStream) -> bool {
     let mut peek_buf = [0u8; 64];
 
     if client_conn.peek(&mut peek_buf).await.is_ok() {
@@ -1280,7 +1269,7 @@ async fn is_http_request(client_conn: &TcpStream) -> bool {
     }
 }
 
-async fn handle_http_redirect(mut stream: TcpStream, port: u16) -> anyhow::Result<()> {
+pub(crate) async fn handle_http_redirect(mut stream: TcpStream, port: u16) -> anyhow::Result<()> {
     let mut buffer = [0u8; 1024];
     let n = stream.read(&mut buffer).await?;
 
@@ -1295,9 +1284,16 @@ async fn handle_http_redirect(mut stream: TcpStream, port: u16) -> anyhow::Resul
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
 
     let host = lines
-        .find(|line| line.to_lowercase().starts_with("host:"))
-        .and_then(|line| line.split(':').nth(1))
-        .map(|h| h.trim())
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value.trim())
+        .and_then(|host| {
+            if host.starts_with('[') {
+                host.find(']').map(|end| &host[..=end])
+            } else {
+                Some(host.split_once(':').map_or(host, |(name, _)| name))
+            }
+        })
         .unwrap_or("localhost");
 
     let response = format!(
@@ -1310,6 +1306,27 @@ async fn handle_http_redirect(mut stream: TcpStream, port: u16) -> anyhow::Resul
 
     stream.write_all(response.as_bytes()).await?;
     Ok(())
+}
+
+/// Turns a TCP bind failure into the message the user sees, naming the
+/// busy port, the missing permission or the unconfigured address.
+pub(crate) fn map_bind_error(
+    error: std::io::Error, address: &str, ip: std::net::IpAddr, port: u16,
+) -> anyhow::Error {
+    match error.kind() {
+        std::io::ErrorKind::AddrInUse => crate::local_port::port_in_use(ip, port, Protocol::Tcp),
+        std::io::ErrorKind::PermissionDenied => {
+            crate::local_port::bind_denied(address, port, Protocol::Tcp)
+        }
+        std::io::ErrorKind::AddrNotAvailable => {
+            crate::local_port::address_unavailable(address, port, Protocol::Tcp)
+        }
+        _ => anyhow::anyhow!(
+            "Failed to bind TCP listener to {}: {}",
+            std::net::SocketAddr::new(ip, port),
+            error
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1325,6 +1342,48 @@ mod tests {
     use tower_test::mock;
 
     use super::*;
+
+    #[tokio::test]
+    async fn http_redirect_preserves_the_host_and_uses_the_forward_port() {
+        for (header, host) in [
+            ("Host: [::1]:8080\r\n", "[::1]"),
+            ("Host: [2001:db8::1]\r\n", "[2001:db8::1]"),
+            ("Host: app.local:8080\r\n", "app.local"),
+            ("hOsT: app.local\r\n", "app.local"),
+            ("Host: 127.0.0.1:8080\r\n", "127.0.0.1"),
+            ("Host: 127.0.0.1\r\n", "127.0.0.1"),
+            ("", "localhost"),
+        ] {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let request = tokio::spawn(async move {
+                    let mut client = TcpStream::connect(address).await.unwrap();
+                    client
+                        .write_all(format!("GET /items?q=one HTTP/1.1\r\n{header}\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                    let mut response = String::new();
+                    client.read_to_string(&mut response).await.unwrap();
+                    response
+                });
+                let (stream, _) = listener.accept().await.unwrap();
+                handle_http_redirect(stream, 8443).await.unwrap();
+                let response = request.await.unwrap();
+                assert_eq!(
+                    response,
+                    format!(
+                        "HTTP/1.1 301 Moved Permanently\r\n\
+                        Location: https://{host}:8443/items?q=one\r\n\
+                        Content-Length: 0\r\n\r\n"
+                    ),
+                    "Host header: {header:?}"
+                );
+            })
+            .await
+            .unwrap();
+        }
+    }
 
     #[test]
     fn a_startup_timeout_names_the_step_that_ran_out_of_time() {
