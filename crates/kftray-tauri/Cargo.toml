@@ -1,6 +1,6 @@
 [package]
 name = "kftray-tauri"
-version = "0.35.1"
+version = "0.35.2"
 authors = ["Henrique Cavarsan <hencavarsan@gmail.com>"]
 edition = "2024"
 description = "A cross-platform system tray app for Kubernetes port-forward management"
@@ -100,4 +100,4 @@ default = ["custom-protocol"]
 # this feature is used used for production builds where `devPath` points to the filesystem
 # DO NOT remove this
 custom-protocol = ["tauri/custom-protocol"]
-e2e = ["dep:tauri-plugin-wdio-webdriver"]
+e2e = ["dep:tauri-plugin-wdio-webdriver", "kftray-portforward/e2e"]
