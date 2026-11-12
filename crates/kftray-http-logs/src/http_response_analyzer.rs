@@ -46,13 +46,8 @@ impl HttpResponseAnalyzer {
     }
 
     pub fn detect_chunked_encoding(response_data: &[u8]) -> bool {
-        if let Some(headers_end) = find_headers_end(response_data) {
-            let header_section = &response_data[..headers_end];
-            return std::str::from_utf8(header_section)
-                .map(|h| h.to_lowercase().contains("transfer-encoding: chunked"))
-                .unwrap_or(false);
-        }
-        false
+        find_headers_end(response_data)
+            .is_some_and(|end| has_chunked_transfer_encoding(&response_data[..end]))
     }
 
     pub fn check_content_length_match(response_data: &[u8]) -> bool {
@@ -308,24 +303,33 @@ impl HttpResponseAnalyzer {
     }
 }
 
+pub(crate) fn has_chunked_transfer_encoding(headers: &[u8]) -> bool {
+    headers
+        .split(|&byte| byte == b'\n')
+        .filter_map(|line| {
+            let colon = line.iter().position(|&byte| byte == b':')?;
+            Some((&line[..colon], &line[colon + 1..]))
+        })
+        .filter(|(name, _)| name.eq_ignore_ascii_case(b"transfer-encoding"))
+        .flat_map(|(_, value)| value.split(|&byte| byte == b','))
+        .last()
+        .is_some_and(|value| value.trim_ascii().eq_ignore_ascii_case(b"chunked"))
+}
+
 fn find_headers_end(data: &[u8]) -> Option<usize> {
     data.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
 fn parse_content_length(headers: &[u8]) -> Option<usize> {
-    std::str::from_utf8(headers)
-        .ok()
-        .and_then(|h| h.to_lowercase().find("content-length:"))
-        .and_then(|pos| {
-            let remaining = &headers[pos + 15..];
-            let end_pos = remaining
-                .iter()
-                .position(|&b| b == b'\r')
-                .unwrap_or(remaining.len());
-            std::str::from_utf8(&remaining[..end_pos])
-                .ok()
-                .and_then(|s| s.trim().parse::<usize>().ok())
+    headers
+        .split(|&b| b == b'\n')
+        .filter_map(|line| {
+            let colon = line.iter().position(|&b| b == b':')?;
+            Some((&line[..colon], &line[colon + 1..]))
         })
+        .find(|(name, _)| name.eq_ignore_ascii_case(b"content-length"))
+        .and_then(|(_, value)| std::str::from_utf8(value).ok())
+        .and_then(|value| value.trim().parse::<usize>().ok())
 }
 
 pub use DEFAULT_MIN_VALID_HEADERS_SIZE as MIN_VALID_HEADERS_SIZE;
@@ -336,19 +340,30 @@ mod tests {
 
     #[test]
     fn test_detect_chunked_encoding() {
-        let chunked_response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\ndata";
-        let non_chunked_response = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\ndata";
-        let no_headers_response = b"some invalid data";
+        let responses: [&[u8]; 4] = [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\ndata",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding:chunked\r\n\r\ndata",
+            b"HTTP/1.1 200 OK\r\nContent-Disposition: attachment; filename=\"caf\xe9.csv\"\r\nTransfer-Encoding: chunked\r\n\r\ndata",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, CHUNKED\r\n\r\ndata",
+        ];
+        assert_eq!(
+            responses.map(HttpResponseAnalyzer::detect_chunked_encoding),
+            [true; 4]
+        );
 
-        assert!(HttpResponseAnalyzer::detect_chunked_encoding(
-            chunked_response
-        ));
-        assert!(!HttpResponseAnalyzer::detect_chunked_encoding(
-            non_chunked_response
-        ));
-        assert!(!HttpResponseAnalyzer::detect_chunked_encoding(
-            no_headers_response
-        ));
+        for response in [
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\ndata"[..],
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\ndata",
+            b"HTTP/1.1 200 OK\r\nX-Transfer-Encoding: chunked\r\n\r\ndata",
+            b"HTTP/1.1 200 OK\r\n\r\ntransfer-encoding: chunked",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n",
+            b"some invalid data",
+        ] {
+            assert!(
+                !HttpResponseAnalyzer::detect_chunked_encoding(response),
+                "{response:?}"
+            );
+        }
     }
 
     #[test]
@@ -545,6 +560,25 @@ mod tests {
         assert_eq!(parse_content_length(no_cl_headers), None);
         assert_eq!(parse_content_length(invalid_cl_headers), None);
         assert_eq!(parse_content_length(empty_headers), None);
+    }
+
+    #[test]
+    fn test_content_length_ignores_longer_header_names() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nX-Goog-Stored-Content-Length: 3\r\nContent-Length: 10\r\n\r\nabc";
+
+        assert_eq!(parse_content_length(response), Some(10));
+        assert!(!HttpResponseAnalyzer::check_content_length_match(response));
+    }
+
+    #[test]
+    fn test_content_length_after_header_that_grows_when_lowercased() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Disposition: attachment; \
+                        filename=\"\u{130}\u{130}\u{130}\u{130}.pdf\"\r\nContent-Length: 5\r\n\r\nhello";
+
+        assert!(HttpResponseAnalyzer::check_content_length_match(
+            response.as_bytes()
+        ));
     }
 
     #[test]

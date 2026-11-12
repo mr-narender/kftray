@@ -42,7 +42,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04]
+        os: [ ubuntu-22.04, ubuntu-24.04 ]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -67,7 +67,7 @@ jobs:
         run: bash hacks/obs/test-package-builds.sh
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Test updater manifest finalization
         run: uv run --project hacks --with pytest python -m pytest hacks/tests/test_fix_updater_json.py
@@ -85,7 +85,7 @@ jobs:
           - distro: opensuse/tumbleweed
             image: opensuse/tumbleweed:latest@sha256:d531cce8158ef9485bcd9defb061cca27b772d796343ab1d66583de6adc38f11
           - distro: opensuse/leap:16.0
-            image: opensuse/leap:16.0@sha256:7f3aeccb6a613c0fc1690d3d3e5eb493fd477ee4587de20640017fc36d72f9b0
+            image: opensuse/leap:16.0@sha256:966ea44f996aa60bd9ef163067a72cb6cdf5282aa4e91706f4d5a00c5d521bbf
     runs-on: ubuntu-24.04
     container: ${{ matrix.image }}
     timeout-minutes: 20
@@ -167,7 +167,7 @@ jobs:
 
   publish:
     name: Publish ${{ inputs.version }} to OBS
-    needs: [checks, rpm-builds, deb-builds, arch-builds]
+    needs: [ checks, rpm-builds, deb-builds, arch-builds ]
     if: github.event_name == 'workflow_dispatch' && inputs.version != ''
     runs-on: ubuntu-22.04
     environment: release
