@@ -131,12 +131,32 @@ fn load_config() -> Result<ProxyConfig, ProxyError> {
 async fn main() -> Result<(), ProxyError> {
     env_logger::init();
 
-    let config = load_config()?;
+    run_server(load_config()?).await
+}
+
+async fn run_server(config: ProxyConfig) -> Result<(), ProxyError> {
     let server = Arc::new(ProxyServer::new(config));
     let server_clone = Arc::clone(&server);
 
-    let server_handle = tokio::spawn(async move { server_clone.run().await });
+    let mut server_handle = tokio::spawn(async move { server_clone.run().await });
 
+    tokio::select! {
+        result = &mut server_handle => return result.map_err(std::io::Error::other)?,
+        _ = wait_for_shutdown() => {}
+    }
+
+    server.shutdown();
+
+    match tokio::time::timeout(tokio::time::Duration::from_secs(5), server_handle).await {
+        Ok(result) => result.map_err(std::io::Error::other)??,
+        Err(e) => error!("Server shutdown timed out: {e}"),
+    }
+
+    info!("Server shutdown complete");
+    Ok(())
+}
+
+async fn wait_for_shutdown() {
     #[cfg(unix)]
     {
         tokio::select! {
@@ -157,15 +177,6 @@ async fn main() -> Result<(), ProxyError> {
         signal::ctrl_c().await.ok();
         info!("Received Ctrl+C signal");
     }
-
-    server.shutdown();
-
-    if let Err(e) = tokio::time::timeout(tokio::time::Duration::from_secs(5), server_handle).await {
-        error!("Server shutdown timed out: {e}");
-    }
-
-    info!("Server shutdown complete");
-    Ok(())
 }
 
 #[cfg(test)]
@@ -217,6 +228,72 @@ mod tests {
                 None => unsafe { env::remove_var(&self.key) },
             }
         }
+    }
+
+    #[tokio::test]
+    async fn occupied_port_returns_bind_error_without_shutdown_signal() {
+        let occupied = proxy::test_utils::setup_test_tcp_echo_server().await;
+
+        for proxy_type in [ProxyType::Tcp, ProxyType::Udp] {
+            let config = ProxyConfig::builder()
+                .target_host("127.0.0.1".to_string())
+                .target_port(9)
+                .proxy_port(occupied.addr().port())
+                .proxy_type(proxy_type)
+                .build()
+                .unwrap();
+
+            let result =
+                tokio::time::timeout(tokio::time::Duration::from_secs(2), run_server(config))
+                    .await
+                    .expect("relay kept running after failing to bind its port");
+
+            assert!(matches!(
+                result,
+                Err(ProxyError::Io(error)) if error.kind() == std::io::ErrorKind::AddrInUse
+            ));
+        }
+
+        occupied.shutdown();
+    }
+
+    async fn occupied_reverse_port_returns_bind_error(http_occupied: bool) {
+        let occupied = proxy::test_utils::setup_test_tcp_echo_server().await;
+        let port = occupied.addr().port();
+        let config = ProxyConfig::builder()
+            .target_host("127.0.0.1".to_string())
+            .target_port(9)
+            .proxy_port(0)
+            .proxy_type(ProxyType::ReverseHttp)
+            .http_port(Some(if http_occupied { port } else { 0 }))
+            .websocket_port(Some(if http_occupied { 0 } else { port }))
+            .build()
+            .unwrap();
+
+        let result =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), run_server(config)).await;
+        occupied.shutdown();
+
+        let error = result
+            .expect("reverse relay kept running after a listener bind failure")
+            .expect_err("reverse relay discarded a listener bind failure");
+        let listener = if http_occupied { "HTTP" } else { "WebSocket" };
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("Failed to bind {listener} server")),
+            "unexpected listener error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn occupied_reverse_http_port_returns_bind_error_without_shutdown_signal() {
+        occupied_reverse_port_returns_bind_error(true).await;
+    }
+
+    #[tokio::test]
+    async fn occupied_reverse_websocket_port_returns_bind_error_without_shutdown_signal() {
+        occupied_reverse_port_returns_bind_error(false).await;
     }
 
     #[test]

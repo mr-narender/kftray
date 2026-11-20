@@ -52,6 +52,7 @@ fn create_test_config() -> Config {
         workload_type: Some("service".to_string()),
         protocol: "tcp".to_string(),
         remote_address: Some("remote-address".to_string()),
+        ssh_provider: None,
         local_address: Some("127.0.0.1".to_string()),
         auto_loopback_address: false,
         alias: Some("test-alias".to_string()),
@@ -244,6 +245,45 @@ mod tests {
             .unwrap();
 
         assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn delete_confirmation_keeps_both_controls_visible_after_resize() {
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        let mut app = create_test_app();
+        app.state = AppState::ShowDeleteConfirmation;
+
+        for (width, height) in [(140, 40), (40, 10), (20, 10), (140, 40)] {
+            terminal.backend_mut().resize(width, height);
+            terminal.autoresize().unwrap();
+            for selected in [DeleteButton::Confirm, DeleteButton::Close] {
+                app.selected_delete_button = selected;
+                terminal
+                    .draw(|frame| draw_ui(frame, &mut app, &[]))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                for label in ["<Confirm>", "<Close>"] {
+                    let position = (0..height).find_map(|y| {
+                        let row: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
+                        row.find(label)
+                            .map(|x| (row[..x].chars().count() as u16, y))
+                    });
+                    let (x, y) = position.unwrap_or_else(|| {
+                        panic!(
+                            "missing {label} at {width}x{height}: {:?}",
+                            terminal.backend()
+                        )
+                    });
+                    let expected = if (label == "<Confirm>") == (selected == DeleteButton::Confirm)
+                    {
+                        crate::tui::ui::LAVENDER
+                    } else {
+                        crate::tui::ui::TEXT
+                    };
+                    assert_eq!(buffer[(x, y)].fg, expected);
+                }
+            }
+        }
     }
 
     #[test]
