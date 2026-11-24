@@ -14,6 +14,18 @@ use sqlx::{
 
 use crate::db::get_db_pool;
 use crate::models::config_model::Config;
+use crate::models::ssh_provider::WORKLOAD_SSH_PORT_FORWARD;
+
+fn drop_kube_placeholders(config: &mut JsonValue, default: &JsonValue) {
+    let Some(fields) = config.as_object_mut() else {
+        return;
+    };
+    for key in ["context", "kubeconfig", "namespace", "service", "target"] {
+        if fields.get(key) == default.get(key) {
+            fields.remove(key);
+        }
+    }
+}
 
 async fn migrate_configs_with_pool(pool: &SqlitePool) -> Result<(), String> {
     info!("Starting configuration migration with provided pool.");
@@ -51,7 +63,10 @@ async fn migrate_configs_with_pool(pool: &SqlitePool) -> Result<(), String> {
             error!("Failed to serialize default config: {e}");
             e.to_string()
         })?;
-        let merged_config_json = merge_json_values(default_config_json, config_json);
+        let mut merged_config_json = merge_json_values(default_config_json.clone(), config_json);
+        if merged_config_json["workload_type"] == WORKLOAD_SSH_PORT_FORWARD {
+            drop_kube_placeholders(&mut merged_config_json, &default_config_json);
+        }
         let updated_data = serde_json::to_string(&merged_config_json).map_err(|e| {
             error!("Failed to serialize merged config: {e}");
             e.to_string()
@@ -260,6 +275,14 @@ async fn migrate_schema(pool: &SqlitePool) -> Result<(), String> {
     migrate_http_logs_config_table(&mut conn).await?;
 
     migrate_shortcuts_table(&mut conn).await?;
+
+    sqlx::query(crate::utils::ssh_host_keys::SSH_HOST_KEYS_DDL)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            error!("Failed to create ssh_host_keys table: {e}");
+            e.to_string()
+        })?;
 
     Ok(())
 }
@@ -610,6 +633,55 @@ mod tests {
             .is_some()
     }
 
+    #[tokio::test]
+    async fn migration_leaves_ssh_rows_without_kube_placeholders() {
+        let pool = setup_test_db().await;
+        let ssh: Config = serde_json::from_value(json!({
+            "workload_type": "ssh-port-forward", "protocol": "tcp", "alias": "db",
+            "local_port": 15432, "remote_address": "10.0.0.5", "remote_port": 5432,
+            "ssh_provider": {
+                "type": "gcp-bastion", "project": "p", "zone": "us-central1-b",
+                "instance": "jumper", "interface": "nic0"
+            }
+        }))
+        .unwrap();
+        insert_config_with_pool(ssh, &pool).await.unwrap();
+
+        migrate_configs(Some(&pool)).await.unwrap();
+        migrate_configs(Some(&pool)).await.unwrap();
+
+        let after = read_configs_with_pool(&pool).await.unwrap().remove(0);
+        assert_eq!(after.context, None);
+        assert_eq!(after.namespace, "");
+        assert_eq!(after.service, None);
+        assert_eq!(after.target, None);
+        assert_eq!(after.kubeconfig, None);
+        assert_eq!(after.local_address.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn migration_keeps_a_real_kube_value_on_an_ssh_row() {
+        let pool = setup_test_db().await;
+        let ssh: Config = serde_json::from_value(json!({
+            "workload_type": "ssh-port-forward", "protocol": "tcp", "alias": "db",
+            "local_port": 15432, "remote_address": "10.0.0.5", "remote_port": 5432,
+            "context": "bastion-ctx", "namespace": "db-ns",
+            "ssh_provider": {
+                "type": "gcp-bastion", "project": "p", "zone": "us-central1-b",
+                "instance": "jumper", "interface": "nic0"
+            }
+        }))
+        .unwrap();
+        insert_config_with_pool(ssh, &pool).await.unwrap();
+
+        migrate_configs(Some(&pool)).await.unwrap();
+
+        let after = read_configs_with_pool(&pool).await.unwrap().remove(0);
+        assert_eq!(after.context.as_deref(), Some("bastion-ctx"));
+        assert_eq!(after.namespace, "db-ns");
+        assert_eq!(after.service, None);
+    }
+
     #[test]
     fn test_merge_json_values_simple() {
         let default = json!({ "a": 1, "b": 2 });
@@ -926,5 +998,45 @@ mod tests {
         assert!(check_trigger_exists(&pool, "after_insert_config").await);
         assert!(check_trigger_exists(&pool, "after_delete_config").await);
         assert!(check_trigger_exists(&pool, "after_insert_config_http_logs").await);
+    }
+
+    async fn toggle_window_shortcut_after_upgrade(saved: Option<&str>) -> String {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("Failed to connect to in-memory database");
+        create_db_table(&pool)
+            .await
+            .expect("Failed to create tables");
+        if let Some(saved) = saved {
+            sqlx::query("INSERT INTO settings (key, value) VALUES ('global_shortcut', ?1)")
+                .bind(saved)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        migrate_configs(Some(&pool)).await.unwrap();
+
+        sqlx::query("SELECT shortcut_key FROM shortcuts WHERE action_type = 'toggle_window'")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("shortcut_key")
+    }
+
+    #[tokio::test]
+    async fn upgrading_keeps_the_custom_global_shortcut() {
+        assert_eq!(
+            toggle_window_shortcut_after_upgrade(Some("Alt+Shift+K")).await,
+            "Alt+Shift+K"
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrading_without_a_global_shortcut_adds_the_default_one() {
+        assert_eq!(
+            toggle_window_shortcut_after_upgrade(None).await,
+            "Ctrl+Shift+F1"
+        );
     }
 }

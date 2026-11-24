@@ -4,6 +4,7 @@ use crate::tests::test_logger_state;
 use crate::tui::input::{
     App,
     DeleteButton,
+    HttpLogEntry,
 };
 use crate::tui::ui::popup::{
     render_about_popup,
@@ -13,6 +14,7 @@ use crate::tui::ui::popup::{
     render_delete_confirmation_popup,
     render_error_popup,
     render_help_popup,
+    render_http_logs_viewer_popup,
     render_input_prompt,
 };
 
@@ -288,5 +290,74 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         assert!(!buffer.content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_log_detail_shows_invalid_method_replay_errors() {
+        let mut app = create_test_app();
+        app.http_logs_detail_mode = true;
+        let entry = HttpLogEntry {
+            trace_id: "invalid-method".into(),
+            request_timestamp: String::new(),
+            response_timestamp: None,
+            method: "BAD METHOD".into(),
+            path: "/api".into(),
+            status_code: None,
+            duration_ms: None,
+            request_headers: vec![],
+            request_body: String::new(),
+            response_headers: vec![],
+            response_body: String::new(),
+        };
+        app.http_logs_selected_entry = Some(entry.clone());
+        app.http_logs_replay = Some(tokio::spawn(async move {
+            entry.replay("http://127.0.0.1:1").await
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while app.http_logs_replay.is_some() {
+                tokio::task::yield_now().await;
+                app.poll_http_logs_replay().await;
+            }
+        })
+        .await
+        .unwrap();
+        let error = app.http_logs_replay_result.clone().unwrap();
+
+        let screen = rendered_screen(160, 50, |frame| {
+            render_http_logs_viewer_popup(frame, &mut app, frame.area());
+        });
+
+        assert!(screen.contains("Replay Error:"), "{screen}");
+        assert!(screen.contains(&error), "{screen}");
+    }
+
+    #[test]
+    fn http_log_detail_shows_the_logged_duration_once() {
+        for (duration_ms, expected) in [
+            (Some("150 ms"), "Duration: 150 ms "),
+            (None, "Duration: N/A "),
+        ] {
+            let mut app = create_test_app();
+            app.http_logs_detail_mode = true;
+            app.http_logs_selected_entry = Some(HttpLogEntry {
+                trace_id: "abc123".into(),
+                request_timestamp: String::new(),
+                response_timestamp: None,
+                method: "GET".into(),
+                path: "/health".into(),
+                status_code: None,
+                duration_ms: duration_ms.map(str::to_string),
+                request_headers: vec![],
+                request_body: String::new(),
+                response_headers: vec![],
+                response_body: String::new(),
+            });
+
+            let screen = rendered_screen(160, 50, |frame| {
+                render_http_logs_viewer_popup(frame, &mut app, frame.area());
+            });
+
+            assert!(screen.contains(expected), "{expected:?} not on screen");
+        }
     }
 }

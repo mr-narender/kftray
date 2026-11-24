@@ -19,50 +19,26 @@ import {
 } from '@/hooks/useKube'
 import { DEFAULT_KUBECONFIG } from '@/hooks/useKubeconfigPicker'
 import { invoke } from '@/lib/tauri'
-import type { ConfigViewResult, StoredConfig } from '@/types'
+import type { ConfigViewResult } from '@/types'
 
 import { CommonFields } from './CommonFields'
 import { ExposeFields } from './ExposeFields'
 import { KubeconfigControl } from './KubeconfigControl'
 import { KubeTargetFields } from './KubeTargetFields'
 import { ProxyFields } from './ProxyFields'
+import { SshForwardFields } from './ssh/SshForwardFields'
 import { TagsField } from './TagsField'
 import type { AddConfigModalProps, ConfigDraft, PortOption } from './types'
 import {
   applyDraftChange,
   tagSuggestions,
   toConfig,
+  toDraft,
   trimConfigValues,
   validateDraft,
 } from './utils'
 
 const FORM_ID = 'add-config-form'
-
-const emptyDraft: ConfigDraft = {
-  alias: '',
-  auto_loopback_address: false,
-  context: '',
-  domain_enabled: false,
-  kubeconfig: DEFAULT_KUBECONFIG,
-  local_address: '127.0.0.1',
-  local_port: '',
-  namespace: '',
-  remote_address: '',
-  remote_port: '',
-  service: '',
-  target: '',
-}
-
-const toDraft = (config: StoredConfig | null): ConfigDraft => {
-  if (!config) {
-    return { ...emptyDraft }
-  }
-  return {
-    ...config,
-    local_port: config.local_port ? String(config.local_port) : '',
-    remote_port: config.remote_port ? String(config.remote_port) : '',
-  }
-}
 
 export function AddConfigModal({
   initialConfig,
@@ -104,7 +80,7 @@ export function AddConfigModal({
     scope,
     draft.workload_type,
     target,
-    draft.workload_type !== 'proxy' && draft.workload_type !== 'expose',
+    draft.workload_type === 'service' || draft.workload_type === 'pod',
   )
   const saveMutation = useMutation({
     mutationFn: onSave,
@@ -148,6 +124,8 @@ export function AddConfigModal({
     handleSave()
   }
   const workloadType = draft.workload_type
+  const usesKubeTarget =
+    !workloadType || workloadType === 'service' || workloadType === 'pod'
   const resourceOptions =
     workloadType === 'pod'
       ? (podsQuery.data ?? []).map(({ labels_str }) => ({
@@ -168,10 +146,12 @@ export function AddConfigModal({
       maxWidth='600px'
       height='96vh'
       headerExtra={
-        <KubeconfigControl
-          kubeconfig={kubeconfig}
-          onChange={selected => update({ kubeconfig: selected })}
-        />
+        workloadType === 'ssh-port-forward' ? undefined : (
+          <KubeconfigControl
+            kubeconfig={kubeconfig}
+            onChange={selected => update({ kubeconfig: selected })}
+          />
+        )
       }
     >
       <AppDialogBody>
@@ -206,7 +186,15 @@ export function AddConfigModal({
                 onUpdate={update}
               />
             )}
-            {workloadType !== 'expose' && workloadType !== 'proxy' && (
+            {workloadType === 'ssh-port-forward' && (
+              <SshForwardFields
+                draft={draft}
+                errors={shownErrors}
+                initialConfig={initialConfig}
+                onUpdate={update}
+              />
+            )}
+            {usesKubeTarget && (
               <KubeTargetFields
                 draft={draft}
                 errors={

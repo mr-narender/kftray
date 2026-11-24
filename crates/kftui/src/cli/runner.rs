@@ -232,6 +232,31 @@ impl PortForwardRunner {
         Ok(None)
     }
 
+    async fn start_network_monitor(mode: DatabaseMode) -> bool {
+        if !kftray_commons::utils::settings::get_network_monitor_with_mode(mode)
+            .await
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        match kftray_network_monitor::start_with_mode(mode).await {
+            Ok(()) => true,
+            Err(error) => {
+                warn!("Failed to start network monitor: {error}");
+                false
+            }
+        }
+    }
+
+    async fn stop_network_monitor(started: &mut bool) {
+        if *started {
+            if let Err(error) = kftray_network_monitor::stop().await {
+                warn!("Failed to stop network monitor: {error}");
+            }
+            *started = false;
+        }
+    }
+
     /// Runs the command given after `--` while the forwards are up, then
     /// stops them. Returns the command's exit code, or 127 or 126 the way a
     /// shell does when the command can't start. A command that exits 0 still
@@ -241,6 +266,7 @@ impl PortForwardRunner {
         mode: DatabaseMode,
     ) -> Result<i32, Box<dyn std::error::Error>> {
         let (program, args) = command.split_first().ok_or("no command given after --")?;
+        let mut network_monitor_started = Self::start_network_monitor(mode).await;
         output::status!("\nRunning {}", command.join(" "));
         let mut child = tokio::process::Command::new(program);
         child.args(args);
@@ -260,12 +286,14 @@ impl PortForwardRunner {
         // As with --non-interactive, the first signal asks for the teardown
         // and only the next one aborts it. A signal during the command
         // counts as the first.
+        kftray_portforward::kube::close_startup_gate();
         output::status!("\nStopping port forwards");
         let stopped = Self::stop_unless_interrupted(
-            Self::stop_all_started(configs, discovery, mode),
+            Self::stop_all_started(configs, discovery, mode, &mut network_monitor_started),
             Self::interrupts(if interrupted { 1 } else { 2 }),
         )
         .await;
+        Self::stop_network_monitor(&mut network_monitor_started).await;
         match stopped {
             Err(error) if code == 0 => Err(error),
             _ => Ok(code),
@@ -474,6 +502,20 @@ impl PortForwardRunner {
         let local_port = config.local_port.unwrap_or(0);
         let remote_port = config.remote_port.unwrap_or(0);
         let namespace = &config.namespace;
+        if config.workload_type.as_deref()
+            == Some(kftray_commons::models::ssh_provider::WORKLOAD_SSH_PORT_FORWARD)
+        {
+            let remote_address = config.remote_address.as_deref().unwrap_or("unknown");
+            let (provider, summary) = config
+                .ssh_provider
+                .as_ref()
+                .map(|provider| (provider.type_name(), provider.summary()))
+                .unwrap_or(("unknown", String::new()));
+            output::status!(
+                "  {alias} {local_port} -> {remote_address}:{remote_port} via {provider} {summary}"
+            );
+            return;
+        }
         let service_or_target = match config.workload_type.as_deref() {
             Some("proxy") => config.remote_address.as_deref().unwrap_or("unknown"),
             Some("pod") => config.target.as_deref().unwrap_or("unknown"),
@@ -490,6 +532,22 @@ impl PortForwardRunner {
     /// mode can tell an incomplete shutdown from a clean one by the exit code.
     async fn wait_for_shutdown_signal(
         configs: Vec<Config>, discovery: Option<DiscoveryWatch>, mode: DatabaseMode,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut network_monitor_started = Self::start_network_monitor(mode).await;
+        let result = Self::wait_for_shutdown_with_monitor(
+            configs,
+            discovery,
+            mode,
+            &mut network_monitor_started,
+        )
+        .await;
+        Self::stop_network_monitor(&mut network_monitor_started).await;
+        result
+    }
+
+    async fn wait_for_shutdown_with_monitor(
+        configs: Vec<Config>, discovery: Option<DiscoveryWatch>, mode: DatabaseMode,
+        network_monitor_started: &mut bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(unix)]
         {
@@ -514,7 +572,8 @@ impl PortForwardRunner {
                                     "Error: no shutdown signal handler could be installed; \
                                      stopping port forwards and exiting"
                                 );
-                                Self::stop_all_started(configs, discovery, mode).await?;
+                                kftray_portforward::kube::close_startup_gate();
+                                Self::stop_all_started(configs, discovery, mode, network_monitor_started).await?;
                                 return Err(
                                     "no shutdown signal handler could be installed".into()
                                 );
@@ -531,21 +590,25 @@ impl PortForwardRunner {
                     }
                 } => {}
             }
+            kftray_portforward::kube::close_startup_gate();
             output::status!("\nStopping port forwards");
 
-            Self::stop_unless_interrupted(Self::stop_all_started(configs, discovery, mode), async {
-                match sigterm.as_mut() {
-                    Some(sigterm) => {
-                        tokio::select! {
-                            _ = signal::ctrl_c() => {}
-                            _ = sigterm.recv() => {}
+            Self::stop_unless_interrupted(
+                Self::stop_all_started(configs, discovery, mode, network_monitor_started),
+                async {
+                    match sigterm.as_mut() {
+                        Some(sigterm) => {
+                            tokio::select! {
+                                _ = signal::ctrl_c() => {}
+                                _ = sigterm.recv() => {}
+                            }
+                        }
+                        None => {
+                            let _ = signal::ctrl_c().await;
                         }
                     }
-                    None => {
-                        let _ = signal::ctrl_c().await;
-                    }
-                }
-            })
+                },
+            )
             .await
         }
         #[cfg(not(unix))]
@@ -556,14 +619,19 @@ impl PortForwardRunner {
                     "Error: no shutdown signal handler could be installed; stopping port \
                      forwards and exiting"
                 );
-                Self::stop_all_started(configs, discovery, mode).await?;
+                kftray_portforward::kube::close_startup_gate();
+                Self::stop_all_started(configs, discovery, mode, network_monitor_started).await?;
                 return Err("no shutdown signal handler could be installed".into());
             }
+            kftray_portforward::kube::close_startup_gate();
             output::status!("\nStopping port forwards");
 
-            Self::stop_unless_interrupted(Self::stop_all_started(configs, discovery, mode), async {
-                let _ = signal::ctrl_c().await;
-            })
+            Self::stop_unless_interrupted(
+                Self::stop_all_started(configs, discovery, mode, network_monitor_started),
+                async {
+                    let _ = signal::ctrl_c().await;
+                },
+            )
             .await
         }
     }
@@ -572,6 +640,7 @@ impl PortForwardRunner {
     /// stopped together with the ones started at launch.
     async fn stop_all_started(
         mut configs: Vec<Config>, discovery: Option<DiscoveryWatch>, mode: DatabaseMode,
+        network_monitor_started: &mut bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(discovery) = discovery {
             let started_ids = discovery
@@ -583,6 +652,7 @@ impl PortForwardRunner {
                 configs.extend(started);
             }
         }
+        Self::stop_network_monitor(network_monitor_started).await;
         Self::stop_all_port_forwards(&configs, mode).await
     }
 

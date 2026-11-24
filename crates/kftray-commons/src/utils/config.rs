@@ -17,6 +17,7 @@ use crate::db::{
 use crate::hostsfile::HostsFile;
 use crate::migration::migrate_configs;
 use crate::models::config_model::Config;
+use crate::models::ssh_provider::WORKLOAD_SSH_PORT_FORWARD;
 use crate::utils::config_view::{
     normalize_tags,
     validate_tags,
@@ -126,76 +127,74 @@ pub async fn delete_all_configs() -> Result<(), String> {
 
 /// Insert a new config and return its assigned ID.
 pub async fn insert_config_with_pool(config: Config, pool: &SqlitePool) -> Result<i64, String> {
-    let config = prepare_config(config)?;
-    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
-
     create_db_table(pool).await.map_err(|e| e.to_string())?;
-
-    // Validate that file mode won't conflict with memory mode ID range
-    let memory_id_start = std::env::var("KFTRAY_MEMORY_ID_START")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(MEMORY_ID_START);
-
-    let next_id_row =
-        sqlx::query("SELECT COALESCE(MAX(id), 0) + 1 as next_id FROM configs WHERE id < ?")
-            .bind(memory_id_start)
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(|e| e.to_string())?;
-
-    let next_id: i64 = next_id_row.try_get("next_id").map_err(|e| e.to_string())?;
-
-    if next_id >= memory_id_start {
-        return Err(format!(
-            "ID conflict detected: next file mode ID ({next_id}) would exceed memory mode start ({memory_id_start})"
-        ));
-    }
-
-    let data = json!(config).to_string();
-    let result = sqlx::query("INSERT INTO configs (data) VALUES (?1)")
-        .bind(data)
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let inserted_id = result.last_insert_rowid();
-    sync_http_logs_config_from_config(&config, inserted_id, pool).await?;
-
-    Ok(inserted_id)
+    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+    insert_config_on(config, &mut conn, DatabaseMode::File).await
 }
 
 pub(crate) async fn insert_config_with_pool_and_mode(
     config: Config, pool: &SqlitePool, mode: DatabaseMode,
 ) -> Result<i64, String> {
-    match mode {
+    create_db_table(pool).await.map_err(|e| e.to_string())?;
+    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+    insert_config_on(config, &mut conn, mode).await
+}
+
+async fn insert_config_on(
+    config: Config, conn: &mut SqliteConnection, mode: DatabaseMode,
+) -> Result<i64, String> {
+    let config = prepare_config(config)?;
+    let data = json!(config).to_string();
+
+    let inserted_id = match mode {
         DatabaseMode::Memory => {
-            let config = prepare_config(config)?;
-            let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
-            create_db_table(pool).await.map_err(|e| e.to_string())?;
-
-            let next_id = get_next_memory_id(pool).await?;
-            let data = json!(config).to_string();
-
+            let next_id = get_next_memory_id(conn).await?;
             sqlx::query("INSERT INTO configs (id, data) VALUES (?1, ?2)")
                 .bind(next_id)
                 .bind(data)
                 .execute(&mut *conn)
                 .await
                 .map_err(|e| e.to_string())?;
-
-            sync_http_logs_config_from_config(&config, next_id, pool).await?;
-            Ok(next_id)
+            next_id
         }
-        DatabaseMode::File => insert_config_with_pool(config, pool).await,
-    }
+        DatabaseMode::File => {
+            // Validate that file mode won't conflict with memory mode ID range
+            let memory_id_start = std::env::var("KFTRAY_MEMORY_ID_START")
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(MEMORY_ID_START);
+
+            let next_id_row =
+                sqlx::query("SELECT COALESCE(MAX(id), 0) + 1 as next_id FROM configs WHERE id < ?")
+                    .bind(memory_id_start)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+            let next_id: i64 = next_id_row.try_get("next_id").map_err(|e| e.to_string())?;
+
+            if next_id >= memory_id_start {
+                return Err(format!(
+                    "ID conflict detected: next file mode ID ({next_id}) would exceed memory mode start ({memory_id_start})"
+                ));
+            }
+
+            sqlx::query("INSERT INTO configs (data) VALUES (?1)")
+                .bind(data)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| e.to_string())?
+                .last_insert_rowid()
+        }
+    };
+
+    sync_http_logs_config_from_config(&config, inserted_id, conn).await?;
+    Ok(inserted_id)
 }
 
 const MEMORY_ID_START: i64 = 100000;
 
-async fn get_next_memory_id(pool: &SqlitePool) -> Result<i64, String> {
-    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
-
+async fn get_next_memory_id(conn: &mut SqliteConnection) -> Result<i64, String> {
     let memory_id_start = std::env::var("KFTRAY_MEMORY_ID_START")
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
@@ -342,8 +341,12 @@ pub async fn get_config(id: i64) -> Result<Config, String> {
 pub(crate) async fn update_config_with_pool(
     config: Config, pool: &SqlitePool,
 ) -> Result<(), String> {
-    let config = prepare_config(config)?;
     let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+    update_config_on(config, &mut conn).await
+}
+
+async fn update_config_on(config: Config, conn: &mut SqliteConnection) -> Result<(), String> {
+    let config = prepare_config(config)?;
     let data = json!(config).to_string();
     sqlx::query("UPDATE configs SET data = ?1 WHERE id = ?2")
         .bind(data)
@@ -353,7 +356,7 @@ pub(crate) async fn update_config_with_pool(
         .map_err(|e| e.to_string())?;
 
     if let Some(config_id) = config.id {
-        sync_http_logs_config_from_config(&config, config_id, pool).await?;
+        sync_http_logs_config_from_config(&config, config_id, conn).await?;
     }
 
     Ok(())
@@ -383,8 +386,13 @@ pub async fn export_configs() -> Result<String, String> {
 fn validate_imported_config(config: &Config) -> Result<(), String> {
     validate_tags(&normalize_tags(config.tags.clone())?)?;
 
-    if config.namespace.is_empty() {
+    let is_ssh = config.workload_type.as_deref() == Some(WORKLOAD_SSH_PORT_FORWARD);
+    if !is_ssh && config.namespace.is_empty() {
         return Err("Namespace is required and cannot be empty".to_string());
+    }
+
+    if !is_ssh && config.ssh_provider.is_some() {
+        return Err("ssh_provider is only valid for ssh-port-forward".to_string());
     }
 
     if !matches!(config.protocol.as_str(), "tcp" | "udp") {
@@ -446,9 +454,26 @@ fn validate_imported_config(config: &Config) -> Result<(), String> {
                 }
             }
         }
+        Some(WORKLOAD_SSH_PORT_FORWARD) => {
+            if config.protocol != "tcp" {
+                return Err("Protocol must be 'tcp' for ssh-port-forward".to_string());
+            }
+            let provider = config
+                .ssh_provider
+                .as_ref()
+                .ok_or("ssh_provider is required for ssh-port-forward")?;
+            provider.kind()?.validate()?;
+            if config.remote_address.as_deref().is_none_or(str::is_empty) {
+                return Err("Remote address is required for ssh-port-forward".to_string());
+            }
+            if config.remote_port.is_none_or(|port| port == 0) {
+                return Err("Remote port is required for ssh-port-forward".to_string());
+            }
+        }
         Some(workload_type) => {
             return Err(format!(
-                "Invalid workload type: {workload_type}. Must be 'service', 'pod', 'proxy', or 'expose'"
+                "Invalid workload type: {workload_type}. Must be 'service', 'pod', 'proxy', \
+                 'expose', or 'ssh-port-forward'"
             ));
         }
         None => {
@@ -485,11 +510,15 @@ fn kubeconfig_or_default(config: &Config) -> &str {
 }
 
 fn configs_match_identity(existing: &Config, incoming: &Config) -> bool {
-    if existing.context != incoming.context
-        || existing.namespace != incoming.namespace
-        || existing.workload_type != incoming.workload_type
-        || existing.protocol != incoming.protocol
-        || kubeconfig_or_default(existing) != kubeconfig_or_default(incoming)
+    if existing.workload_type != incoming.workload_type || existing.protocol != incoming.protocol {
+        return false;
+    }
+
+    let is_ssh = existing.workload_type.as_deref() == Some(WORKLOAD_SSH_PORT_FORWARD);
+    if !is_ssh
+        && (existing.context != incoming.context
+            || existing.namespace != incoming.namespace
+            || kubeconfig_or_default(existing) != kubeconfig_or_default(incoming))
     {
         return false;
     }
@@ -498,6 +527,11 @@ fn configs_match_identity(existing: &Config, incoming: &Config) -> bool {
         Some("service") => existing.service == incoming.service,
         Some("pod") => existing.target == incoming.target,
         Some("proxy") => existing.remote_address == incoming.remote_address,
+        Some(WORKLOAD_SSH_PORT_FORWARD) => {
+            existing.ssh_provider == incoming.ssh_provider
+                && existing.remote_address == incoming.remote_address
+                && existing.remote_port == incoming.remote_port
+        }
         Some("expose") => {
             return existing.alias.as_deref().map(str::trim)
                 == incoming.alias.as_deref().map(str::trim)
@@ -584,7 +618,7 @@ fn find_identity_match(configs: &[Config], incoming: &Config) -> IdentityMatch {
 }
 
 fn assign_identity_matches(
-    saved: &[Config], incoming: Vec<Config>,
+    saved: &[Config], incoming: Vec<Config>, skip_ambiguous: bool,
 ) -> Vec<(Config, Option<&Config>)> {
     let matches: Vec<_> = incoming
         .iter()
@@ -605,7 +639,7 @@ fn assign_identity_matches(
         .zip(matches)
         .enumerate()
         .filter_map(|(position, (config, m))| match m {
-            IdentityMatch::SavedMoreThanOnce => {
+            IdentityMatch::SavedMoreThanOnce if skip_ambiguous => {
                 info!("Several saved configs match an imported config, skipping it");
                 None
             }
@@ -629,58 +663,10 @@ fn configs_are_identical(existing: &Config, incoming: &Config) -> bool {
     existing_clone == incoming_clone
 }
 
-async fn merge_config_with_existing(
-    config: Config, existing: Option<&Config>, pool: &SqlitePool,
-) -> Result<(), String> {
-    if let Some(existing) = existing {
-        info!(
-            "Found matching config ID={}, checking if update needed",
-            existing.id.unwrap_or(-1)
-        );
-        if configs_are_identical(existing, &config) {
-            info!("Config is identical, skipping");
-            return Ok(());
-        }
-
-        info!("Config has changes, updating");
-        let mut updated_config = config;
-        updated_config.id = existing.id;
-
-        if updated_config.alias.is_none() || updated_config.alias.as_deref() == Some("") {
-            updated_config.alias = existing.alias.clone();
-        }
-
-        if updated_config.local_port.is_none() || updated_config.local_port == Some(0) {
-            updated_config.local_port = existing.local_port;
-        }
-
-        update_config_with_pool(updated_config, pool).await?;
-    } else {
-        info!("No matching config found, inserting new config");
-        insert_config_with_pool(config, pool).await?;
-    }
-
-    Ok(())
-}
-
 pub(crate) async fn import_configs_with_pool(
     json: String, pool: &SqlitePool,
 ) -> Result<(), String> {
-    let configs = parse_import_configs(&json)?;
-
-    let existing_configs = read_configs_with_pool(pool).await?;
-
-    for (config, existing) in assign_identity_matches(&existing_configs, configs) {
-        merge_config_with_existing(config, existing, pool)
-            .await
-            .map_err(|e| format!("Failed to merge config: {e}"))?;
-    }
-
-    if let Err(e) = migrate_configs(Some(pool)).await {
-        return Err(format!("Error migrating configs: {e}"));
-    }
-
-    Ok(())
+    import_configs_with_pool_and_mode(json, pool, DatabaseMode::File).await
 }
 
 pub fn parse_import_configs(json: &str) -> Result<Vec<Config>, String> {
@@ -724,7 +710,7 @@ fn dedup_configs(configs: Vec<Config>) -> Vec<Config> {
 }
 
 async fn merge_config_with_existing_and_mode(
-    config: Config, existing: Option<&Config>, pool: &SqlitePool, mode: DatabaseMode,
+    config: Config, existing: Option<&Config>, conn: &mut SqliteConnection, mode: DatabaseMode,
 ) -> Result<i64, String> {
     if let Some(existing) = existing {
         let id = existing
@@ -748,11 +734,11 @@ async fn merge_config_with_existing_and_mode(
             updated_config.local_port = existing.local_port;
         }
 
-        update_config_with_pool(updated_config, pool).await?;
+        update_config_on(updated_config, conn).await?;
         Ok(id)
     } else {
         info!("No matching config found, inserting new config");
-        insert_config_with_pool_and_mode(config, pool, mode).await
+        insert_config_on(config, conn, mode).await
     }
 }
 
@@ -760,19 +746,7 @@ pub(crate) async fn import_configs_with_pool_and_mode(
     json: String, pool: &SqlitePool, mode: DatabaseMode,
 ) -> Result<(), String> {
     let configs = parse_import_configs(&json)?;
-
-    let existing_configs = read_configs_with_pool(pool).await?;
-
-    for (config, existing) in assign_identity_matches(&existing_configs, configs) {
-        merge_config_with_existing_and_mode(config, existing, pool, mode)
-            .await
-            .map_err(|e| format!("Failed to merge config: {e}"))?;
-    }
-
-    if let Err(e) = migrate_configs(Some(pool)).await {
-        return Err(format!("Error migrating configs: {e}"));
-    }
-
+    save_imported_configs(configs, pool, mode, false).await?;
     Ok(())
 }
 
@@ -817,20 +791,48 @@ pub async fn upsert_configs_with_mode(
 pub async fn upsert_configs_with_pool_and_mode(
     configs: Vec<Config>, pool: &SqlitePool, mode: DatabaseMode,
 ) -> Result<Vec<i64>, String> {
+    save_imported_configs(configs, pool, mode, false).await
+}
+
+pub(crate) async fn replace_configs_with_pool(
+    configs: Vec<Config>, pool: &SqlitePool,
+) -> Result<Vec<i64>, String> {
+    save_imported_configs(configs, pool, DatabaseMode::File, true).await
+}
+
+async fn save_imported_configs(
+    configs: Vec<Config>, pool: &SqlitePool, mode: DatabaseMode, replace: bool,
+) -> Result<Vec<i64>, String> {
     let existing_configs = read_configs_with_pool(pool).await?;
     let configs = dedup_configs(configs);
-    let matches = assign_identity_matches(&existing_configs, configs);
+    let matches = assign_identity_matches(&existing_configs, configs, !replace);
 
+    create_db_table(pool).await.map_err(|e| e.to_string())?;
+    let mut transaction = pool.begin().await.map_err(|e| e.to_string())?;
     let mut ids = Vec::with_capacity(matches.len());
     for (config, existing) in matches {
-        let id = merge_config_with_existing_and_mode(config, existing, pool, mode)
+        let id = merge_config_with_existing_and_mode(config, existing, &mut transaction, mode)
             .await
             .map_err(|e| format!("Failed to merge config: {e}"))?;
         ids.push(id);
     }
+    transaction.commit().await.map_err(|e| e.to_string())?;
 
     if let Err(e) = migrate_configs(Some(pool)).await {
         return Err(format!("Error migrating configs: {e}"));
+    }
+
+    if replace {
+        let removed_ids = existing_configs
+            .into_iter()
+            .filter_map(|config| config.id)
+            .filter(|id| !ids.contains(id))
+            .collect::<Vec<_>>();
+        if !removed_ids.is_empty() {
+            delete_configs_with_pool(removed_ids, pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
     }
 
     Ok(ids)
@@ -1039,10 +1041,10 @@ fn prepare_config(mut config: Config) -> Result<Config, String> {
 }
 
 async fn sync_http_logs_config_from_config(
-    config: &Config, config_id: i64, pool: &SqlitePool,
+    config: &Config, config_id: i64, conn: &mut SqliteConnection,
 ) -> Result<(), String> {
     use crate::models::http_logs_config_model::HttpLogsConfig;
-    use crate::utils::http_logs_config::update_http_logs_config_with_pool;
+    use crate::utils::http_logs_config::update_http_logs_config_on;
 
     let http_config = HttpLogsConfig {
         config_id,
@@ -1052,7 +1054,7 @@ async fn sync_http_logs_config_from_config(
         auto_cleanup: config.http_logs_auto_cleanup.unwrap_or(true),
     };
 
-    update_http_logs_config_with_pool(&http_config, pool).await
+    update_http_logs_config_on(&http_config, conn).await
 }
 
 #[cfg(test)]
@@ -1460,6 +1462,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn export_keeps_proxy_hosts_targets_and_aliases_named_like_defaults() {
+        let pool = setup_test_db().await;
+        let base = Config {
+            namespace: "default".to_string(),
+            context: Some("dev".to_string()),
+            protocol: "tcp".to_string(),
+            remote_port: Some(80),
+            ..Config::default()
+        };
+        let saved = [
+            Config {
+                workload_type: Some("proxy".to_string()),
+                local_port: Some(18081),
+                remote_address: Some("default-target".to_string()),
+                alias: Some("proxy-control".to_string()),
+                ..base.clone()
+            },
+            Config {
+                workload_type: Some("service".to_string()),
+                local_port: Some(18080),
+                service: Some("web".to_string()),
+                alias: Some("default-alias".to_string()),
+                domain_enabled: Some(true),
+                ..base.clone()
+            },
+            Config {
+                workload_type: Some("pod".to_string()),
+                local_port: Some(18082),
+                target: Some("default-target".to_string()),
+                alias: Some("pod-control".to_string()),
+                ..base.clone()
+            },
+        ];
+        for config in saved {
+            insert_config_with_pool(config, &pool).await.unwrap();
+        }
+
+        let exported = export_configs_with_pool(&pool).await.unwrap();
+        let imported = parse_import_configs(&exported).unwrap();
+
+        let kept: Vec<_> = imported
+            .iter()
+            .map(|c| {
+                (
+                    c.remote_address.as_deref(),
+                    c.target.as_deref(),
+                    c.alias.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                (Some("default-target"), None, Some("proxy-control")),
+                (None, None, Some("default-alias")),
+                (None, Some("default-target"), Some("pod-control")),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn pod_forward_keeps_its_domain_alias_after_export_and_import() {
         let pool = setup_test_db().await;
         let saved = Config {
@@ -1655,6 +1718,82 @@ mod tests {
                 .iter()
                 .any(|c| c.service == Some("imported-service2".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn test_import_of_hundreds_of_configs_saves_every_row_and_http_logs_entry() {
+        let pool = setup_test_db().await;
+        let configs_json = serde_json::Value::Array(
+            (0..300)
+                .map(|i| {
+                    json!({
+                        "service": format!("svc-{i}"),
+                        "workload_type": "service",
+                        "protocol": "tcp",
+                        "context": "kind-test",
+                        "namespace": "ns",
+                        "local_port": 20000 + i,
+                        "remote_port": 80,
+                        "http_logs_enabled": i % 2 == 0
+                    })
+                })
+                .collect(),
+        )
+        .to_string();
+
+        import_configs_with_pool(configs_json, &pool).await.unwrap();
+
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        let http_logs = crate::utils::http_logs_config::read_all_http_logs_configs_with_pool(&pool)
+            .await
+            .unwrap();
+        assert_eq!(configs.len(), 300);
+        assert_eq!(http_logs.len(), 300);
+        for config in &configs {
+            let port = config.local_port.unwrap();
+            let entry = http_logs
+                .iter()
+                .find(|entry| Some(entry.config_id) == config.id)
+                .unwrap();
+            assert_eq!(entry.enabled, port % 2 == 0, "{port}");
+            assert_eq!(config.http_logs_enabled, Some(port % 2 == 0), "{port}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_import_that_fails_on_one_config_keeps_the_saved_ones_as_they_were() {
+        let pool = setup_test_db().await;
+        let service = |name: &str, alias: &str| Config {
+            service: Some(name.to_string()),
+            workload_type: Some("service".to_string()),
+            protocol: "tcp".to_string(),
+            context: Some("kind-test".to_string()),
+            namespace: "ns".to_string(),
+            local_port: Some(5000),
+            remote_port: Some(80),
+            alias: Some(alias.to_string()),
+            ..Config::default()
+        };
+        let saved_id = insert_config_with_pool(service("saved", "before"), &pool)
+            .await
+            .unwrap();
+        let mut broken = service("broken", "broken");
+        broken.tags = BTreeMap::from([
+            ("Team".to_string(), "core".to_string()),
+            ("team".to_string(), "payments".to_string()),
+        ]);
+
+        let result = upsert_configs_with_pool_and_mode(
+            vec![service("saved", "after"), service("new", "new"), broken],
+            &pool,
+            DatabaseMode::File,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let configs = read_configs_with_pool(&pool).await.unwrap();
+        let aliases: Vec<_> = configs.iter().map(|c| (c.id, c.alias.clone())).collect();
+        assert_eq!(aliases, vec![(Some(saved_id), Some("before".to_string()))]);
     }
 
     #[tokio::test]
@@ -2175,6 +2314,166 @@ mod tests {
         );
         let unknown = validate_imported_config(&expose("cluster", "udp")).unwrap_err();
         assert!(unknown.contains("got 'udp'"), "{unknown}");
+    }
+
+    fn ssh_import(overrides: serde_json::Value) -> String {
+        let mut base = json!({"workload_type": "ssh-port-forward", "protocol": "tcp",
+            "alias": "jumper", "local_port": 8080, "remote_address": "proxy.internal",
+            "remote_port": 80,
+            "ssh_provider": {"type": "gcp-bastion", "project": "p", "zone": "us-central1-b",
+                "instance": "jumper"}});
+        base.as_object_mut()
+            .unwrap()
+            .extend(overrides.as_object().unwrap().clone());
+        json!([base]).to_string()
+    }
+
+    #[test]
+    fn test_import_should_accept_ssh_config_without_namespace() {
+        let configs = parse_import_configs(&ssh_import(json!({}))).unwrap();
+        assert_eq!(configs[0].namespace, "");
+    }
+
+    #[test]
+    fn test_import_should_report_missing_zone_for_gcp_bastion() {
+        let provider = json!({"type": "gcp-bastion", "project": "p", "instance": "jumper"});
+        let error =
+            parse_import_configs(&ssh_import(json!({"ssh_provider": provider}))).unwrap_err();
+        assert!(error.contains("missing field `zone`"), "{error}");
+    }
+
+    #[test]
+    fn test_import_should_reject_invalid_ssh_configs() {
+        let cases = [
+            (
+                json!({"protocol": "udp"}),
+                "Protocol must be 'tcp' for ssh-port-forward",
+            ),
+            (json!({"remote_address": ""}), "Remote address is required"),
+            (json!({"remote_port": 0}), "Remote port is required"),
+            (
+                json!({"ssh_provider": {"type": "aws-ssm"}}),
+                "\"aws-ssm\" is not supported",
+            ),
+            (
+                json!({"ssh_provider": {"type": "gcp-bastion", "project": "p",
+                    "zone": "nope", "instance": "j"}}),
+                "GCP zone \"nope\"",
+            ),
+        ];
+        for (overrides, expected) in cases {
+            let error = parse_import_configs(&ssh_import(overrides)).unwrap_err();
+            assert!(
+                error.contains(expected),
+                "{error} should contain {expected}"
+            );
+        }
+
+        let no_provider = json!([{"workload_type": "ssh-port-forward", "protocol": "tcp",
+            "remote_address": "h", "remote_port": 1}]);
+        let error = parse_import_configs(&no_provider.to_string()).unwrap_err();
+        assert!(error.contains("ssh_provider is required"), "{error}");
+
+        let on_service = json!([{"workload_type": "service", "protocol": "tcp",
+            "namespace": "default", "service": "s", "context": "c",
+            "ssh_provider": {"type": "gcp-bastion", "project": "p", "zone": "us-central1-b",
+                "instance": "j"}}]);
+        let error = parse_import_configs(&on_service.to_string()).unwrap_err();
+        assert!(error.contains("only valid for ssh-port-forward"), "{error}");
+    }
+
+    #[test]
+    fn test_configs_match_identity_should_compare_ssh_provider_and_destination() {
+        let base = parse_import_configs(&ssh_import(json!({})))
+            .unwrap()
+            .remove(0);
+        assert!(configs_match_identity(&base, &base.clone()));
+        let other_port = Config {
+            remote_port: Some(81),
+            ..base.clone()
+        };
+        assert!(!configs_match_identity(&base, &other_port));
+        let other_host = Config {
+            remote_address: Some("other".into()),
+            ..base.clone()
+        };
+        assert!(!configs_match_identity(&base, &other_host));
+        let other_instance = parse_import_configs(&ssh_import(json!({"ssh_provider":
+            {"type": "gcp-bastion", "project": "p", "zone": "us-central1-b", "instance": "x"}})))
+        .unwrap()
+        .remove(0);
+        assert!(!configs_match_identity(&base, &other_instance));
+    }
+
+    #[test]
+    fn test_configs_match_identity_should_ignore_kubernetes_fields_for_ssh() {
+        let base = parse_import_configs(&ssh_import(json!({})))
+            .unwrap()
+            .remove(0);
+        let with_defaults = Config {
+            context: Some(Config::DEFAULT_CONTEXT.to_string()),
+            namespace: "default-namespace".to_string(),
+            kubeconfig: Some("default".to_string()),
+            service: Some("default-service".to_string()),
+            target: Some("default-target".to_string()),
+            ..base.clone()
+        };
+        assert!(configs_match_identity(&with_defaults, &base));
+        assert!(configs_match_identity(&base, &with_defaults));
+        let kube_service = Config {
+            workload_type: Some("service".to_string()),
+            ..with_defaults
+        };
+        assert!(!configs_match_identity(&kube_service, &base));
+    }
+
+    #[tokio::test]
+    async fn test_import_same_ssh_config_twice_should_keep_one_row() {
+        let pool = setup_test_db().await;
+        let json = ssh_import(json!({}));
+
+        import_configs_with_pool(json.clone(), &pool).await.unwrap();
+        import_configs_with_pool(json, &pool).await.unwrap();
+
+        assert_eq!(read_configs_with_pool(&pool).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_ssh_export_reimport_should_keep_same_row() {
+        let pool = setup_test_db().await;
+        import_configs_with_pool(ssh_import(json!({})), &pool)
+            .await
+            .unwrap();
+        let before = read_configs_with_pool(&pool).await.unwrap();
+
+        let exported = export_configs_with_pool(&pool).await.unwrap();
+        import_configs_with_pool(exported, &pool).await.unwrap();
+
+        let after = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, before[0].id);
+    }
+
+    #[tokio::test]
+    async fn test_unknown_ssh_provider_should_survive_insert_read_and_export() {
+        let pool = setup_test_db().await;
+        let provider = json!({"type": "aws-ssm", "target": "i-1"});
+        let config: Config = serde_json::from_value(json!({
+            "workload_type": "ssh-port-forward", "protocol": "tcp", "alias": "x",
+            "remote_address": "h", "remote_port": 1, "ssh_provider": provider
+        }))
+        .unwrap();
+        insert_config_with_pool(config, &pool).await.unwrap();
+
+        let stored = read_configs_with_pool(&pool).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&stored[0].ssh_provider).unwrap(),
+            provider
+        );
+
+        let exported: serde_json::Value =
+            serde_json::from_str(&export_configs_with_pool(&pool).await.unwrap()).unwrap();
+        assert_eq!(exported[0]["ssh_provider"], provider);
     }
 
     #[tokio::test]

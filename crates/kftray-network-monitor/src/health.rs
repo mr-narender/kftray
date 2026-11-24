@@ -103,6 +103,7 @@ impl HealthChecker {
 
         let mut futs: FuturesUnordered<_> = configs
             .iter()
+            .filter(|config| listens_locally(config))
             .map(|config_clone| {
                 let checker = self.clone();
                 let config_clone = config_clone.clone();
@@ -143,6 +144,7 @@ impl HealthChecker {
 
         let mut futs: FuturesUnordered<_> = configs
             .iter()
+            .filter(|config| listens_locally(config))
             .map(|config_clone| {
                 let checker = self.clone();
                 let config_clone = config_clone.clone();
@@ -177,6 +179,10 @@ impl HealthChecker {
     }
 }
 
+fn listens_locally(config: &Config) -> bool {
+    config.workload_type.as_deref() != Some("expose")
+}
+
 async fn udp_port_in_use(local_address: &str, local_port: u16) -> bool {
     if probe_udp_addr_in_use(local_address, local_port).await {
         return true;
@@ -191,8 +197,15 @@ async fn probe_udp_addr_in_use(addr: &str, port: u16) -> bool {
     let socket_addr = format!("{addr}:{port}");
     match tokio::net::UdpSocket::bind(&socket_addr).await {
         Ok(_) => false,
-        Err(e) => e.kind() == std::io::ErrorKind::AddrInUse,
+        Err(e) => bind_error_means_port_held(e.kind()),
     }
+}
+
+fn bind_error_means_port_held(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+    )
 }
 
 impl Clone for HealthChecker {
@@ -231,6 +244,17 @@ mod tests {
                 Duration::ZERO,
             )
             .await
+    }
+
+    #[test]
+    fn a_bind_denied_on_a_privileged_port_counts_as_held() {
+        assert!(bind_error_means_port_held(std::io::ErrorKind::AddrInUse));
+        assert!(bind_error_means_port_held(
+            std::io::ErrorKind::PermissionDenied
+        ));
+        assert!(!bind_error_means_port_held(
+            std::io::ErrorKind::AddrNotAvailable
+        ));
     }
 
     #[tokio::test]

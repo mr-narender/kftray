@@ -125,7 +125,14 @@ pub async fn serve(listener: TcpListener) -> anyhow::Result<()> {
     let mut connections = JoinSet::new();
 
     loop {
-        let (stream, remote_addr) = listener.accept().await?;
+        let (stream, remote_addr) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(err) => {
+                error!("Failed to accept MCP connection: {err}, retrying in 1s");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
         while connections.try_join_next().is_some() {}
         let io = TokioIo::new(stream);
         let state = Arc::clone(&state);
@@ -181,7 +188,10 @@ async fn handle_mcp_post(req: Request<Incoming>, state: Arc<ServerState>) -> Res
             if state.get_session(&id).await.is_some() {
                 id
             } else {
-                state.create_session().await
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Full::new(Bytes::from("Session not found")))
+                    .unwrap();
             }
         }
         None => state.create_session().await,
@@ -532,11 +542,16 @@ mod tests {
 
     use super::*;
 
-    async fn post_mcp(addr: SocketAddr, body: &str) -> (u16, String) {
+    async fn request_mcp(
+        addr: SocketAddr, method: &str, body: &str, session_id: Option<&str>,
+    ) -> (u16, Option<String>, String) {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let session_header = session_id
+            .map(|id| format!("Mcp-Session-Id: {id}\r\n"))
+            .unwrap_or_default();
         let request = format!(
-            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "{method} /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             {session_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(request.as_bytes()).await.unwrap();
@@ -544,7 +559,146 @@ mod tests {
         stream.read_to_string(&mut raw).await.unwrap();
         let (head, body) = raw.split_once("\r\n\r\n").unwrap();
         let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
-        (status, body.to_string())
+        let session_id = head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("mcp-session-id")
+                .then(|| value.trim().to_string())
+        });
+        (status, session_id, body.to_string())
+    }
+
+    #[tokio::test]
+    async fn ended_sessions_reject_posts_until_fresh_initialization() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve(listener));
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "session-test", "version": "1"}
+            }
+        })
+        .to_string();
+        let notification = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let list_tools = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        let tool_call = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_configs","arguments":{}}}"#;
+
+        let (status, session_id, body) = request_mcp(addr, "POST", &initialize, None).await;
+        assert_eq!(status, 200);
+        let session_id = session_id.unwrap();
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+        assert_eq!(
+            request_mcp(addr, "POST", notification, Some(&session_id))
+                .await
+                .0,
+            202
+        );
+        assert_eq!(
+            request_mcp(addr, "DELETE", "", Some(&session_id)).await.0,
+            200
+        );
+        assert_eq!(request_mcp(addr, "GET", "", Some(&session_id)).await.0, 404);
+
+        for id in [session_id.as_str(), "unknown-session"] {
+            for body in [tool_call, notification, initialize.as_str()] {
+                let (status, returned_session, _) = request_mcp(addr, "POST", body, Some(id)).await;
+                assert_eq!(status, 404, "session: {id}, body: {body}");
+                assert_eq!(returned_session, None);
+            }
+        }
+
+        let (status, fresh_session, body) = request_mcp(addr, "POST", &initialize, None).await;
+        assert_eq!(status, 200);
+        let fresh_session = fresh_session.unwrap();
+        assert_ne!(fresh_session, session_id);
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+        assert_eq!(
+            request_mcp(addr, "POST", notification, Some(&fresh_session))
+                .await
+                .0,
+            202
+        );
+        let (status, returned_session, body) =
+            request_mcp(addr, "POST", list_tools, Some(&fresh_session)).await;
+        assert_eq!(status, 200);
+        assert_eq!(returned_session.as_deref(), Some(fresh_session.as_str()));
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            reply["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| { tool["name"] == "list_configs" })
+        );
+
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_keeps_accepting_after_running_out_of_file_descriptors() {
+        use tokio::io::AsyncBufReadExt;
+
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(
+                "ulimit -n 64 && exec \"$0\" --exact --ignored --nocapture \
+                 server::tests::serve_with_few_file_descriptors_in_child",
+            )
+            .arg(std::env::current_exe().unwrap())
+            .env("KFTRAY_MCP_FD_LIMIT_CHILD", "1")
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let addr: SocketAddr = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let line = lines.next_line().await.unwrap().expect("child exited");
+                if let Some(addr) = line.strip_prefix("MCP_ADDR=") {
+                    break addr.parse().unwrap();
+                }
+            }
+        })
+        .await
+        .expect("child never printed its address");
+
+        let mut idle = Vec::new();
+        for _ in 0..80 {
+            idle.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        drop(idle);
+
+        let health = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut stream = tokio::net::TcpStream::connect(addr).await?;
+            stream
+                .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .await?;
+            let mut raw = String::new();
+            stream.read_to_string(&mut raw).await?;
+            Ok::<_, std::io::Error>(raw)
+        })
+        .await
+        .expect("health request timed out")
+        .expect("health request failed");
+        assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "run by serve_keeps_accepting_after_running_out_of_file_descriptors"]
+    async fn serve_with_few_file_descriptors_in_child() {
+        if std::env::var_os("KFTRAY_MCP_FD_LIMIT_CHILD").is_none() {
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        println!("MCP_ADDR={}", listener.local_addr().unwrap());
+        serve(listener).await.unwrap();
     }
 
     #[tokio::test]
@@ -557,16 +711,28 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
             r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#,
         ] {
-            assert_eq!(post_mcp(addr, body).await, (202, String::new()), "{body}");
+            let (status, _, reply) = request_mcp(addr, "POST", body, None).await;
+            assert_eq!((status, reply), (202, String::new()), "{body}");
         }
 
-        let (status, reply) = post_mcp(addr, r#"{"jsonrpc":"2.0","method":"ping","id":7}"#).await;
+        let (status, _, reply) = request_mcp(
+            addr,
+            "POST",
+            r#"{"jsonrpc":"2.0","method":"ping","id":7}"#,
+            None,
+        )
+        .await;
         assert_eq!(status, 200);
         let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(reply["id"], 7);
 
-        let (status, reply) =
-            post_mcp(addr, r#"{"jsonrpc":"2.0","method":"ping","id":null}"#).await;
+        let (status, _, reply) = request_mcp(
+            addr,
+            "POST",
+            r#"{"jsonrpc":"2.0","method":"ping","id":null}"#,
+            None,
+        )
+        .await;
         assert_eq!(status, 200);
         let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(reply["error"]["code"], error_codes::INVALID_REQUEST);

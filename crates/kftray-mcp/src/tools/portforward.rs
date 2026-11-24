@@ -21,10 +21,7 @@ use crate::protocol::{
 use crate::tools::McpTool;
 
 async fn start_config(config: Config) -> Result<Vec<CustomResponse>, String> {
-    let workload_type = config.workload_type.as_deref();
-    let direct = workload_type == Some("expose")
-        || (matches!(workload_type, None | Some("service" | "pod")) && config.protocol == "tcp");
-    if direct {
+    if config.forwards_directly() {
         kftray_portforward::start_port_forward(vec![config], "tcp").await
     } else {
         kftray_portforward::deploy_and_forward_pod(vec![config]).await
@@ -138,6 +135,7 @@ struct StartPortForwardArgs {
     namespace: Option<String>,
     service: Option<String>,
     target: Option<String>,
+    remote_address: Option<String>,
     local_port: Option<u16>,
     remote_port: Option<u16>,
     protocol: Option<String>,
@@ -181,6 +179,10 @@ impl McpTool for StartPortForwardTool {
                 "target": {
                     "type": "string",
                     "description": "Pod label selector (required for workload_type 'pod', e.g., 'app=nginx')"
+                },
+                "remote_address": {
+                    "type": "string",
+                    "description": "Destination host (required for workload_type 'proxy')"
                 },
                 "local_port": {
                     "type": "integer",
@@ -312,7 +314,8 @@ impl McpTool for StartPortForwardTool {
                 context: args.context,
                 workload_type: Some(workload_type),
                 protocol: args.protocol.unwrap_or_else(|| "tcp".to_string()),
-                remote_address: None,
+                remote_address: args.remote_address,
+                ssh_provider: None,
                 local_address: Some("127.0.0.1".to_string()),
                 auto_loopback_address: false,
                 alias: args.alias,

@@ -79,7 +79,7 @@ fn init_file_logger() -> anyhow::Result<()> {
     let log_dir = commands::logs::log_dir().map_err(|e| anyhow::anyhow!(e))?;
     let basename = format!(
         "kftray_{}",
-        jiff::Zoned::now().strftime("%Y-%m-%d_%H-%M-%S")
+        jiff::ZonedDateTime::now().strftime("%Y-%m-%d_%H-%M-%S")
     );
     // flexi_logger's own errors (file write/rotation failures) go here instead
     // of stderr, which is often broken when launched from a desktop entry. The
@@ -100,13 +100,12 @@ fn init_file_logger() -> anyhow::Result<()> {
         flexi_logger::Duplicate::None
     };
 
-    commands::logs::file_logger(&log_dir, &basename)?
-        .duplicate_to_stdout(console)
-        .error_channel(flexi_logger::ErrorChannel::File(error_log))
-        // Even the error file can fail (disk full, read-only dir); never abort
-        // the app over a logging problem.
-        .panic_if_error_channel_is_broken(false)
-        .start()?;
+    commands::logs::start_file_logger(
+        commands::logs::file_logger(&log_dir, &basename)?
+            .duplicate_to_stdout(console)
+            .error_channel(flexi_logger::ErrorChannel::File(error_log))
+            .panic_if_error_channel_is_broken(false),
+    )?;
 
     Ok(())
 }
@@ -426,6 +425,8 @@ fn main() {
             commands::portforward::deploy_and_forward_pod_cmd,
             commands::portforward::stop_proxy_forward_cmd,
             commands::portforward::get_active_pod_cmd,
+            commands::ssh::test_ssh_forward_cmd,
+            commands::ssh::forget_ssh_host_key_cmd,
             commands::httplogs::set_http_logs_cmd,
             commands::httplogs::get_http_logs_cmd,
             commands::httplogs::get_http_logs_config_cmd,
